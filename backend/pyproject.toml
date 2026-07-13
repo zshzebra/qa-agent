@@ -3,5 +3,11 @@ name = "backend"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
+    "arize-phoenix>=17.26.0",
+    "exa-py>=2.16.0",
     "fastapi[standard]>=0.139.0",
+    "openinference-instrumentation-pydantic-ai>=0.1.17",
+    "opentelemetry-exporter-otlp>=1.42.1",
+    "opentelemetry-sdk>=1.42.1",
+    "pydantic-ai>=2.9.0",
 ]
