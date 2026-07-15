@@ -9,12 +9,12 @@ from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from pydantic_ai import Agent, RunContext, ToolDefinition
+from pydantic_ai import Agent, ModelSettings, RunContext, ToolDefinition, ToolOutput
 from pydantic_ai.capabilities import Hooks, Instrumentation
 from pydantic_ai.common_tools.exa import ExaToolset
 from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.profiles.openai import OpenAIModelProfile
+from pydantic_ai.providers.openai import OpenAIProvider
 from tools.buffer import BufferToolset
 
 dotenv.load_dotenv()
@@ -54,16 +54,11 @@ async def process_tool_result(
 
 
 smart_model = OpenAIChatModel(
-    "zai-glm-4.7",
-    provider="cerebras",
-    profile=OpenAIModelProfile(openai_supports_strict_tool_definition=False),
+    "google/diffusiongemma-26b-a4b-it",
+    provider=OpenAIProvider(base_url="http://localhost:8002/v1"),
 )
 
-research_model = OpenAIChatModel(
-    "gpt-oss-120b",
-    provider="cerebras",
-    profile=OpenAIModelProfile(openai_supports_strict_tool_definition=False),
-)
+research_model = smart_model
 
 
 @dataclass
@@ -95,7 +90,7 @@ class PlanStatus:
 
 planning_agent = Agent(
     smart_model,
-    output_type=PlanStatus,
+    output_type=ToolOutput(PlanStatus, name="PlanStatus"),
     instructions=(
         "You run in the background. A separate conversational agent talks to the "
         "user; you never talk to the user directly. You maintain one plan in the "
@@ -133,6 +128,7 @@ planning_agent = Agent(
     deps_type=buffer_deps,
     toolsets=[BufferToolset()],
     capabilities=[Instrumentation(InstrumentationSettings(version=2))],
+    retries=3,
 )
 
 
@@ -166,15 +162,16 @@ async def spawn_research_agent(ctx: RunContext[buffer_deps], target: str) -> str
 research_agent = Agent(
     research_model,
     instructions="Using exa answer primarily, you need to research the given question until you are confident, or explain why you could not find the answer. You must include reasoning as to why your answer was good or not.",
-    output_type=ResearchOutput,
+    output_type=ToolOutput(ResearchOutput, name="ResearchOutput"),
     toolsets=[exa_toolset],
     capabilities=[hooks, Instrumentation(InstrumentationSettings(version=2))],
+    retries=3,
 )
 
 user_agent = Agent(
     smart_model,
     deps_type=buffer_deps,
-    output_type=NextMessage,
+    output_type=ToolOutput(NextMessage, name="NextMessage"),
     instructions=(
         "You are the friendly voice talking to the user. A background planner "
         "keeps a plan in the buffer, including a 'Next message to user' directive.\n"
@@ -202,6 +199,7 @@ user_agent = Agent(
         "- One message at a time. Natural and concise, never a form."
     ),
     capabilities=[Instrumentation(InstrumentationSettings(version=2))],
+    retries=3,
 )
 
 
