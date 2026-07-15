@@ -13,10 +13,10 @@ class BufferToolset(FunctionToolset[HasBuffer]):
         super().__init__()
         self.context_lines = context_lines
 
-        self.add_function(self.read_buffer)
-        self.add_function(self.write_buffer)
-        self.add_function(self.edit_buffer)
-        self.add_function(self.clear_buffer)
+        self.add_function(self.read_buffer, retries=3)
+        self.add_function(self.write_buffer, retries=3)
+        self.add_function(self.edit_buffer, retries=3)
+        self.add_function(self.clear_buffer, retries=3)
 
         @self.instructions
         def _(ctx: RunContext[HasBuffer]) -> str:
@@ -32,7 +32,13 @@ class BufferToolset(FunctionToolset[HasBuffer]):
         self, ctx: RunContext[HasBuffer], start: int = 1, end: int | None = None
     ) -> str:
         lines = ctx.deps.buffer.split("\n")
-        end = end or len(lines)
+        if end is None:
+            end = len(lines)
+        if start < 1 or end > len(lines) or start > end:
+            raise ModelRetry(
+                f"range {start}-{end} is out of bounds; buffer has {len(lines)} "
+                f"line(s), valid range is 1-{len(lines)}"
+            )
         return "\n".join(f"{i}| {lines[i - 1]}" for i in range(start, end + 1))
 
     def write_buffer(self, ctx: RunContext[HasBuffer], content: str) -> str:
