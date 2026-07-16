@@ -43,7 +43,9 @@ class BufferToolset(FunctionToolset[HasBuffer]):
 
     def write_buffer(self, ctx: RunContext[HasBuffer], content: str) -> str:
         if ctx.deps.buffer:
-            raise ModelRetry("buffer not empty")
+            raise ModelRetry(
+                "buffer not empty. Either use `edit_buffer` or clear the the buffer first, before writing to it."
+            )
         ctx.deps.buffer = content
         return content
 
