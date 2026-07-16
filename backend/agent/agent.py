@@ -9,12 +9,11 @@ from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from pydantic_ai import Agent, ModelSettings, RunContext, ToolDefinition, ToolOutput
+from pydantic_ai import Agent, RunContext, ToolDefinition, ToolOutput
 from pydantic_ai.capabilities import Hooks, Instrumentation
 from pydantic_ai.common_tools.exa import ExaToolset
+from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.instrumented import InstrumentationSettings
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.openai import OpenAIProvider
 from tools.buffer import BufferToolset
 
 dotenv.load_dotenv()
@@ -53,11 +52,7 @@ async def process_tool_result(
     return result
 
 
-smart_model = OpenAIChatModel(
-    "google/diffusiongemma-26b-a4b-it",
-    provider=OpenAIProvider(base_url="http://localhost:8002/v1"),
-)
-
+smart_model = GoogleModel("gemini-3.1-flash-lite-preview")
 research_model = smart_model
 
 
