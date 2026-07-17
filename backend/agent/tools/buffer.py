@@ -21,11 +21,18 @@ class BufferToolset(FunctionToolset[HasBuffer]):
         @self.instructions
         def _(ctx: RunContext[HasBuffer]) -> str:
             return (
-                "You have CRUD access to a text buffer."
-                "Read buffer returns the contents, optionally between a range, with line numbers."
-                "Write buffer will set the contents of the buffer. The buffer needs to be empty, orelse it will fail."
-                "Edit buffer accepts a string to replace, and it's value. The target must match exactly once across the whole file."
-                "Clear buffer nulls the contents."
+                "You have CRUD access to a single text buffer.\n"
+                "- read_buffer returns the contents (optionally a line range) with "
+                "line numbers.\n"
+                "- write_buffer sets the whole buffer, but only when it is empty; "
+                "if it already has content it will fail, so use edit_buffer "
+                "instead.\n"
+                "- edit_buffer replaces an exact substring with a new value — the "
+                "target must appear exactly once, so include enough surrounding "
+                "text to make it unique, otherwise the edit is rejected.\n"
+                "- clear_buffer empties the buffer.\n"
+                "Prefer edit_buffer for incremental changes; use write_buffer only "
+                "for the initial fill."
             )
 
     def read_buffer(

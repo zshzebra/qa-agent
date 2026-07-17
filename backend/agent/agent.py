@@ -2,14 +2,18 @@ import asyncio
 import os
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 import dotenv
 from openinference.instrumentation.pydantic_ai import OpenInferenceSpanProcessor
+from openinference.semconv.trace import SpanAttributes
+from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from pydantic_ai import Agent, RunContext, ToolDefinition, ToolOutput
+from opentelemetry.trace import Link
+from pydantic_ai import Agent, ModelMessage, RunContext, ToolDefinition, ToolOutput
 from pydantic_ai.capabilities import Hooks, Instrumentation
 from pydantic_ai.common_tools.exa import ExaToolset
 from pydantic_ai.models.google import GoogleModel
@@ -23,6 +27,7 @@ assert exa_api_key is not None
 
 tracer_provider = TracerProvider()
 trace.set_tracer_provider(tracer_provider)
+tracer = trace.get_tracer("lead-form")
 
 endpoint = "http://127.0.0.1:6006/v1/traces"
 exporter = OTLPSpanExporter(endpoint=endpoint)
@@ -33,7 +38,7 @@ exa_toolset = ExaToolset(
     exa_api_key,
     num_results=5,
     max_characters=1000,
-    include_search=True,
+    include_search=False,
     include_find_similar=True,
     include_get_contents=False,
     include_answer=True,
@@ -54,6 +59,7 @@ async def process_tool_result(
 
 smart_model = GoogleModel("gemini-3.1-flash-lite-preview")
 research_model = smart_model
+auditor_model = smart_model
 
 
 @dataclass
@@ -62,6 +68,7 @@ class buffer_deps:
     research_out: asyncio.Queue | None = None
     planner_trigger: asyncio.Queue | None = None
     tasks: set = field(default_factory=set)
+    session_id: str = ""
 
 
 @dataclass
@@ -83,42 +90,64 @@ class PlanStatus:
     note: str = ""
 
 
+@dataclass
+class AuditResult:
+    approved: bool
+    issues: str = ""
+
+
 planning_agent = Agent(
     smart_model,
     output_type=ToolOutput(PlanStatus, name="PlanStatus"),
     instructions=(
-        "You run in the background. A separate conversational agent talks to the "
-        "user; you never talk to the user directly. You maintain one plan in the "
-        "buffer: read it first, then edit it, do not blindly overwrite.\n\n"
-        "Goal: assemble name, abn, website, email, phone, address, industry, "
-        "date_first_active, founder, via research and the user's guidance.\n\n"
-        "Research: call spawn_research_agent to dispatch a researcher. It runs in "
-        "the BACKGROUND and returns nothing immediately; its result comes back to "
-        "you as input in a later cycle. Record what you have dispatched under "
-        "'Unknown / researching' so you do not re-dispatch it. Research can find "
-        "most fields; the user is best for the company name, industry, "
-        "disambiguation, and confirming found facts. You MAY still ask the user "
-        "about a field research is working on when genuinely useful, but avoid "
-        "firing a question research is about to answer anyway.\n\n"
-        "Each cycle, update the buffer and write a single 'Next message to user' "
-        "directive: the one thing the conversational agent should say or ask next, "
-        "or 'nothing yet' if the right move is to wait for pending research."
-        "conversational agent reads this and decides whether to actually speak.\n\n"
-        "When surfacing found facts for confirmation, do it a few at a time, "
-        "grouped naturally (say the core identity first: website and industry; "
-        "then contact details; then registration and founders). Do not ask the "
-        "user to confirm everything in one directive.\n\n"
-        "The conversational agent reads this and decides whether to actually speak.\n\n"
-        "Keep the buffer in this shape, current:\n"
+        "You run in the background and never speak to the user directly — a "
+        "separate conversational agent does that. You maintain a single plan in a "
+        "text buffer: read it first, then edit it, do not blindly overwrite.\n\n"
+        "Your job is to assemble the company's details and get them confirmed by "
+        "the user: name, website, industry, abn, address, phone, email, "
+        "date_first_active, founder.\n\n"
+        "What makes this feel fast or slow is research latency: a researcher takes "
+        "many seconds to return, and its result only reaches you on a later cycle. "
+        "So when you start research decides how long the user waits. If you hold "
+        "off researching a field until the user brings it up, the user then has to "
+        "sit through that researcher's full runtime as dead time. If you start it "
+        "the moment you have anything to search on, in the background, the result "
+        "is already waiting by the time it's relevant — so it appears instant to "
+        "them. Treat any moment a researcher could be running but isn't as latency "
+        "you are personally adding to the user's experience.\n\n"
+        "For the same reason, fan out: dispatch several focused researchers at "
+        "once rather than one broad query. They run concurrently, so several small "
+        "searches finish in roughly the time of the slowest one, whereas a single "
+        "query covering everything runs those lookups back-to-back. Call "
+        "spawn_research_agent to dispatch each; it runs in the background and "
+        "returns nothing immediately.\n\n"
+        "The user is for confirming and disambiguating what research finds — not "
+        "for looking things up. Asking them for a fact research could fetch trades "
+        "fast machine work for a slow human round-trip.\n\n"
+        "As results arrive, move them into the buffer for confirmation and write "
+        "the '## Next message to user' directive to confirm them a few at a time, "
+        "grouped naturally — core identity first (website, industry), then "
+        "contacts, then registration and founders — because a wall of every field "
+        "at once is hard to confirm and slows the user down.\n\n"
+        "Each cycle: read the buffer, update it, and write a single 'Next message "
+        "to user' directive — the one thing the conversational agent should say or "
+        "ask next, or 'nothing yet' when the right move is to wait for pending "
+        "research. The conversational agent reads this and decides whether to "
+        "actually speak.\n\n"
+        "Keep the buffer in this shape:\n"
         "## Confirmed by user\n"
         "## Found via research (awaiting confirmation)\n"
-        "## Unknown / researching\n"
+        "## Researching (dispatched — do not re-dispatch)\n"
+        "## Not yet started\n"
         "## Next message to user\n"
-        "<one short directive, or 'nothing yet'>"
-        "\n\nEnd every turn by returning PlanStatus. Set done=true only when every "
+        "<one short directive, or 'nothing yet'>\n"
+        "List a field under 'Researching' only once you have actually dispatched a "
+        "researcher for it, so you don't fire the same search twice; anything not "
+        "confirmed, found, or dispatched stays under 'Not yet started' so you can "
+        "see there is still work to kick off.\n\n"
+        "End every turn by returning PlanStatus. Set done=true only when every "
         "field is assembled and confirmed and nothing remains to research or ask; "
-        "otherwise done=false. Put a brief closing summary in note when done, or a "
-        "short status of what you are waiting on when not."
+        "otherwise done=false, with a short note on what you're waiting on."
     ),
     deps_type=buffer_deps,
     toolsets=[BufferToolset()],
@@ -130,12 +159,23 @@ planning_agent = Agent(
 @planning_agent.tool
 async def spawn_research_agent(ctx: RunContext[buffer_deps], target: str) -> str:
     deps = ctx.deps
+    dispatch_ctx = trace.get_current_span().get_span_context()
 
     async def _run() -> None:
         try:
-            run = await research_agent.run(
-                f"Please find the following information: {target}"
-            )
+            with tracer.start_as_current_span(
+                "researcher",
+                context=otel_context.Context(),
+                links=[Link(dispatch_ctx)],
+                attributes={
+                    SpanAttributes.SESSION_ID: deps.session_id,
+                    "research.target": target,
+                },
+            ):
+                run = await research_agent.run(
+                    f"Please find the following information: {target}",
+                    conversation_id=deps.session_id,
+                )
             out = run.output
             msg = (
                 f"Research result for '{target}':\n"
@@ -156,10 +196,40 @@ async def spawn_research_agent(ctx: RunContext[buffer_deps], target: str) -> str
 
 research_agent = Agent(
     research_model,
-    instructions="Using exa answer primarily, you need to research the given question until you are confident, or explain why you could not find the answer. You must include reasoning as to why your answer was good or not.",
+    instructions=(
+        "You are a research sub-agent; your answer is consumed by another agent, "
+        "not shown to a user, so be concise and factual. Use exa_answer as your "
+        "primary tool. Search thoroughly until you are confident in the answer, or "
+        "can clearly explain why it could not be found. Return the specific "
+        "fact(s) found — or a clear statement that you could not find them — plus "
+        "brief reasoning on how you found it and why it is trustworthy. Never "
+        "fabricate — a wrong fact gets surfaced to the user as if true, so an "
+        "honest 'not found' is more useful than a guess."
+    ),
     output_type=ToolOutput(ResearchOutput, name="ResearchOutput"),
     toolsets=[exa_toolset],
     capabilities=[hooks, Instrumentation(InstrumentationSettings(version=2))],
+    retries=3,
+)
+
+auditor_agent = Agent(
+    auditor_model,
+    output_type=ToolOutput(AuditResult, name="AuditResult"),
+    instructions=(
+        "You are a strict auditor deciding whether a data-collection task is "
+        "genuinely complete. You are given the full user conversation and the "
+        "planner's plan. Do not trust the plan's '## Confirmed by user' section: "
+        "verify it against the conversation. For every field the plan treats as "
+        "confirmed, find the user message that actually confirms that specific "
+        "field; if there is no such message, it is not confirmed. Also check that "
+        "nothing is still awaiting confirmation or being researched, that the last "
+        "assistant message does not expect a reply, and that the user has no open "
+        "objection or question. Set approved=true only if every confirmed field is "
+        "backed by an explicit user confirmation and nothing is pending; otherwise "
+        "approved=false and list precisely which fields are unconfirmed and what is "
+        "pending in issues, so the planner can fix it."
+    ),
+    capabilities=[Instrumentation(InstrumentationSettings(version=2))],
     retries=3,
 )
 
@@ -180,13 +250,19 @@ user_agent = Agent(
         "Guidance:\n"
         "- Present anything under 'Found via research (awaiting confirmation)' for "
         "the user to confirm ('I found X, does that look right?') with "
-        "expects_reply=true. Never ask the user to supply it.\n"
+        "expects_reply=true. Never ask the user to supply it — the planner is "
+        "already fetching it, and asking would waste the user's time on something "
+        "arriving anyway.\n"
+        "- If the user asks about progress ('have you found them?'), answer "
+        "honestly from the current plan — share what is already found and awaiting "
+        "confirmation rather than a generic 'still looking', which reads as evasive "
+        "when you actually have results.\n"
         "- When presenting found facts for the user to confirm, keep it to a short "
         'paragraph at most, a couple of items at a time, phrased warmly ("I found '
         "your site is example.com and you're in venture capital, is that right?\"). "
-        "Never recite a long list of every field in one message. If the directive "
-        "hands you many facts at once, surface only the first natural group and "
-        "leave the rest for the next turn.\n"
+        "A long list of every field at once is hard to check, so if the directive "
+        "hands you many facts, surface only the first natural group and leave the "
+        "rest for the next turn.\n"
         "- Send a status update (speak=true, expects_reply=false) sparingly, only "
         "when a real wait is starting and the user would otherwise be left hanging.\n"
         "- If the directive is 'nothing yet' and there is nothing new worth saying, "
@@ -205,6 +281,29 @@ def current_plan(ctx: RunContext[buffer_deps]) -> str:
     return f"Current plan:\n{ctx.deps.buffer}"
 
 
+MAX_AUDIT_RETRIES = 2
+
+AUDIT_FEEDBACK = (
+    "A background check found fields marked confirmed that the user never actually "
+    "confirmed: {issues}. Do not finish. For each one, move it from '## Confirmed "
+    "by user' back to '## Found via research (awaiting confirmation)'. Then write "
+    "the '## Next message to user' directive so the conversational agent asks the "
+    "user to confirm those specific facts as the natural next step, e.g. 'I also "
+    "have your ABN as <value> and your address as <value>, is that correct?'."
+)
+
+
+async def run_audit(deps: buffer_deps, dialogue: list[str], session_id: str):
+    transcript = "\n".join(dialogue)
+    with tracer.start_as_current_span(
+        "auditor", attributes={SpanAttributes.SESSION_ID: session_id}
+    ):
+        return await auditor_agent.run(
+            f"Conversation:\n{transcript}\n\nPlan:\n{deps.buffer}",
+            conversation_id=session_id,
+        )
+
+
 async def run_planner(
     deps: buffer_deps,
     dialogue: list[str],
@@ -212,7 +311,10 @@ async def run_planner(
     research_out: "asyncio.Queue[str]",
     notify: "asyncio.Queue[None]",
     done: asyncio.Event,
+    session_id: str,
 ) -> None:
+    history: list[ModelMessage] = []
+    sent = 0
     while True:
         await trigger.get()
         while not trigger.empty():
@@ -222,17 +324,57 @@ async def run_planner(
         while not research_out.empty():
             findings.append(research_out.get_nowait())
 
-        conversation = "\n".join(dialogue) or "(no conversation yet)"
-        parts = [f"Current conversation:\n{conversation}"]
+        new_lines = dialogue[sent:]
+        sent = len(dialogue)
+
+        parts = []
+        if new_lines:
+            parts.append("New in the conversation:\n" + "\n".join(new_lines))
         if findings:
             parts.append("New research results:\n\n" + "\n\n".join(findings))
+        if not parts:
+            parts.append(
+                "Nothing new arrived. Re-check the plan and decide the next step."
+            )
 
-        result = await planning_agent.run("\n\n".join(parts), deps=deps)
+        with tracer.start_as_current_span(
+            "planner", attributes={SpanAttributes.SESSION_ID: session_id}
+        ):
+            result = await planning_agent.run(
+                "\n\n".join(parts),
+                message_history=history,
+                deps=deps,
+                conversation_id=session_id,
+            )
+        history = result.all_messages()
         notify.put_nowait(None)
-        if result.output.done:
-            print(f"\nPlanner finished: {result.output.note}")
-            done.set()
-            return
+
+        audit_retries = 0
+        while result.output.done:
+            audit = await run_audit(deps, dialogue, session_id)
+            if audit.output.approved:
+                print(f"\nPlanner finished: {result.output.note}")
+                done.set()
+                return
+            audit_retries += 1
+            if audit_retries > MAX_AUDIT_RETRIES:
+                print(
+                    "\nPlanner finishing with unresolved audit issues: "
+                    f"{audit.output.issues}"
+                )
+                done.set()
+                return
+            with tracer.start_as_current_span(
+                "planner", attributes={SpanAttributes.SESSION_ID: session_id}
+            ):
+                result = await planning_agent.run(
+                    AUDIT_FEEDBACK.format(issues=audit.output.issues),
+                    message_history=history,
+                    deps=deps,
+                    conversation_id=session_id,
+                )
+            history = result.all_messages()
+            notify.put_nowait(None)
 
 
 async def run_speaker(
@@ -241,7 +383,10 @@ async def run_speaker(
     dialogue: list[str],
     agent_floor: asyncio.Event,
     user_turn: asyncio.Queue[None],
+    session_id: str,
 ) -> None:
+    history: list[ModelMessage] = []
+    sent = 0
     while True:
         await notify.get()
         while not notify.empty():
@@ -250,12 +395,25 @@ async def run_speaker(
         if not agent_floor.is_set():
             continue
 
-        conversation = "\n".join(dialogue) or "(conversation not started)"
-        result = await user_agent.run(
+        new_lines = dialogue[sent:]
+        sent = len(dialogue)
+        prompt = (
             "The plan changed. Decide the single next thing to say to the user, "
-            f"or stay silent.\n\nConversation so far:\n{conversation}",
-            deps=deps,
+            "or stay silent."
         )
+        if new_lines:
+            prompt += "\n\nNew since your last check:\n" + "\n".join(new_lines)
+
+        with tracer.start_as_current_span(
+            "chat", attributes={SpanAttributes.SESSION_ID: session_id}
+        ):
+            result = await user_agent.run(
+                prompt,
+                message_history=history,
+                deps=deps,
+                conversation_id=session_id,
+            )
+        history = result.all_messages()
         out = result.output
         if out.speak and out.message.strip():
             print(f"\n{out.message}")
@@ -273,21 +431,28 @@ async def main() -> None:
     user_turn = asyncio.Queue[None]()
     agent_floor = asyncio.Event()
     done = asyncio.Event()
+    session_id = str(uuid4())
 
-    deps = buffer_deps(research_out=research_out, planner_trigger=trigger)
+    deps = buffer_deps(
+        research_out=research_out, planner_trigger=trigger, session_id=session_id
+    )
 
     planner = asyncio.create_task(
-        run_planner(deps, dialogue, trigger, research_out, notify, done)
+        run_planner(deps, dialogue, trigger, research_out, notify, done, session_id)
     )
     speaker = asyncio.create_task(
-        run_speaker(deps, notify, dialogue, agent_floor, user_turn)
+        run_speaker(deps, notify, dialogue, agent_floor, user_turn, session_id)
     )
 
-    opener = await user_agent.run(
-        "Greet the user warmly in one line and ask which company they work for. "
-        "Ask only that, and set speak=true.",
-        deps=deps,
-    )
+    with tracer.start_as_current_span(
+        "chat", attributes={SpanAttributes.SESSION_ID: session_id}
+    ):
+        opener = await user_agent.run(
+            "Greet the user warmly in one line and ask which company they work for. "
+            "Ask only that, and set speak=true.",
+            deps=deps,
+            conversation_id=session_id,
+        )
     print(opener.output.message)
     dialogue.append(f"Assistant: {opener.output.message}")
 
