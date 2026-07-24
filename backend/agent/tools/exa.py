@@ -22,6 +22,7 @@ class ExaWithoutCitation:
         self, ctx, /, *, call, tool_def: ToolDefinition, args, result: Any
     ):
         """Tool hook to drop citations from `exa_answer` results."""
-        if tool_def.name == "exa_answer":
-            return result["answer"]
+        # TODO: Don't drop the citations
+        if "citations" in result:
+            result.pop("citations", None)
         return result

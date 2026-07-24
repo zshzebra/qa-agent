@@ -1,7 +1,7 @@
 import asyncio
 import os
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from typing import Any
 from uuid import uuid4
 
 import dotenv
@@ -93,15 +93,14 @@ class AuditResult:
 
 
 def load_instructions(agent: str):
-    f = open(
+    with open(
         os.path.join(
             os.path.dirname(__file__),
             f"instructions/{agent}.md",
         ),
         "r",
-    )
-    instructions = f.read()
-    f.close()
+    ) as f:
+        instructions = f.read()
     return instructions
 
 
@@ -109,10 +108,7 @@ def instrumented_capabilities(extra: list[AgentCapability]) -> list[AgentCapabil
     return [Instrumentation(InstrumentationSettings(version=2)), *extra]
 
 
-OutputT = TypeVar("OutputT")
-
-
-def tool_output(t: type[OutputT]) -> ToolOutput[OutputT]:
+def tool_output[OutputT](t: type[OutputT]) -> ToolOutput[OutputT]:
     return ToolOutput(t, name=t.__name__)
 
 
