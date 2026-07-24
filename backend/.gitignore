@@ -10,6 +10,7 @@ devenv.local.yaml
 .pre-commit-config.yaml
 
 .env
+session.json
 
 __pycache__/
 *.py[codz]
