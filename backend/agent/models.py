@@ -29,7 +29,7 @@ class AuditResult:
 
 @dataclass
 class SystemOutput:
-    kind: Literal["message", "done", "error"]
+    kind: Literal["message", "state", "done", "error"]
     message: str = ""
     expects_reply: bool = False
     final_plan: str = ""

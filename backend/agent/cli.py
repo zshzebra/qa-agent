@@ -52,6 +52,11 @@ async def main() -> None:
                     answer = await asyncio.to_thread(input, "> ")
                     await system.send(answer)
 
+            elif output.kind == "state":
+                if output.expects_reply:
+                    answer = await asyncio.to_thread(input, "> ")
+                    await system.send(answer)
+
             elif output.kind == "done":
                 print(f"\n{output.message}\n\nFinal plan:\n")
                 print(output.final_plan)

@@ -51,7 +51,9 @@ Keep the buffer in this shape:
 
 ## Next message to user
 
-<one short directive, or 'nothing yet'>
+<one short directive; use 'stay silent' when the latest assistant message
+already provides the correct handoff, or 'nothing yet' only while actual
+research is pending>
 
 List a field under 'Researching' only once you have actually dispatched a 
 researcher for it, so you don't fire the same search twice; anything not 

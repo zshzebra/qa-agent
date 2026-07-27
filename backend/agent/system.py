@@ -4,11 +4,13 @@ import asyncio
 import json
 import os
 from dataclasses import asdict
+from time import monotonic
 from typing import Any
 from uuid import uuid4
 
 from openinference.semconv.trace import SpanAttributes
 from opentelemetry import context as otel_context
+from opentelemetry import metrics
 from opentelemetry import trace
 from opentelemetry.trace import Link
 from pydantic_ai import (
@@ -47,6 +49,20 @@ def require_env(name: str) -> str:
 
 
 tracer = trace.get_tracer("lead-form")
+meter = metrics.get_meter("lead-form")
+quiescence_detections = meter.create_counter(
+    "lead_form.quiescence.detections",
+    description="Number of times an unfinished session had no owner or active work.",
+)
+reconciliation_outcomes = meter.create_counter(
+    "lead_form.reconciliation.outcomes",
+    description="Outcomes of planner reconciliation cycles.",
+)
+reconciliation_duration = meter.create_histogram(
+    "lead_form.reconciliation.duration",
+    unit="s",
+    description="Time from quiescence detection to a live session outcome.",
+)
 
 exa_without_citation = ExaWithoutCitation(require_env("EXA_API_KEY"))
 smart_model = GoogleModel("gemini-3.1-flash-lite-preview")
@@ -73,6 +89,7 @@ def tool_output[OutputT](t: type[OutputT]) -> ToolOutput[OutputT]:
 
 MAX_AUDIT_RETRIES = 2
 AUDIT_FEEDBACK = load_instructions("audit_feedback")
+RECONCILE_HINT = load_instructions("reconcile")
 
 
 class AgentSystem:
@@ -99,6 +116,10 @@ class AgentSystem:
         self.research_completion_order: int = state.get("research_completion_order", 0)
         self.planner_pending: bool = state.get("planner_pending", False)
         self.speaker_pending: bool = state.get("speaker_pending", False)
+        self.planner_trigger: str = state.get("planner_trigger", "normal")
+        self.reconciliation_attempted: bool = state.get(
+            "reconciliation_attempted", False
+        )
         self.waiting_for_user: bool = state.get("waiting_for_user", False)
         self.is_done: bool = state.get("is_done", False)
         self.done_note: str = state.get("done_note", "")
@@ -114,6 +135,11 @@ class AgentSystem:
         self._outputs: asyncio.Queue[SystemOutput] = asyncio.Queue()
         self._tasks: set[asyncio.Task[Any]] = set()
         self._research_tasks: dict[str, asyncio.Task[None]] = {}
+        self._planner_active = False
+        self._speaker_active = False
+        self._reconciliation_id: str | None = None
+        self._reconciliation_started_at: float | None = None
+        self._reconciliation_link: Any | None = None
         self._started = False
         self._closing = False
 
@@ -150,6 +176,8 @@ class AgentSystem:
                 "research_completion_order": self.research_completion_order,
                 "planner_pending": self.planner_pending,
                 "speaker_pending": self.speaker_pending,
+                "planner_trigger": self.planner_trigger,
+                "reconciliation_attempted": self.reconciliation_attempted,
                 "waiting_for_user": self.waiting_for_user,
                 "is_done": self.is_done,
                 "done_note": self.done_note,
@@ -198,6 +226,7 @@ class AgentSystem:
             self._planner_wakeup.set()
         if speaker_pending:
             self._speaker_wakeup.set()
+        await self._check_quiescence("startup")
 
     async def send(self, message: str) -> None:
         message = message.strip()
@@ -211,7 +240,7 @@ class AgentSystem:
                 raise RuntimeError("The agent system has completed")
             if self.failure is not None:
                 raise RuntimeError(self.failure)
-            if not self.waiting_for_user:
+            if not self.waiting_for_user and not self._is_quiescent_locked():
                 raise RuntimeError("The agent system is not waiting for user input")
             self.dialogue.append(
                 DialogueMessage(
@@ -220,6 +249,9 @@ class AgentSystem:
                 )
             )
             self.waiting_for_user = False
+            self.reconciliation_attempted = False
+            self._clear_reconciliation_locked()
+            self.planner_trigger = "normal"
             self.planner_pending = True
         self._planner_wakeup.set()
 
@@ -228,6 +260,159 @@ class AgentSystem:
 
     async def wait_done(self) -> None:
         await self._done.wait()
+
+    def _is_quiescent_locked(self) -> bool:
+        return (
+            self._started
+            and not self._closing
+            and not self.is_done
+            and self.failure is None
+            and not self.waiting_for_user
+            and not self.planner_pending
+            and not self.speaker_pending
+            and not self._planner_active
+            and not self._speaker_active
+            and not any(
+                job.status in {"queued", "running"} for job in self.research_jobs
+            )
+            and not any(
+                job.status in {"completed", "failed"} and not job.consumed
+                for job in self.research_jobs
+            )
+        )
+
+    async def _check_quiescence(self, source: str = "unknown") -> None:
+        schedule_reconciliation = False
+        force_user_handoff = False
+        reconciliation = None
+        detection_attributes: dict[str, Any] = {}
+
+        async with self._state_lock:
+            if not self._is_quiescent_locked():
+                return
+
+            queued = sum(job.status == "queued" for job in self.research_jobs)
+            running = sum(job.status == "running" for job in self.research_jobs)
+            unconsumed = sum(
+                job.status in {"completed", "failed"} and not job.consumed
+                for job in self.research_jobs
+            )
+            detection_attributes = {
+                SpanAttributes.SESSION_ID: self.session_id,
+                "lead_form.quiescence.source": source,
+                "lead_form.quiescence.reconciliation_attempted": (
+                    self.reconciliation_attempted
+                ),
+                "lead_form.planner.pending": self.planner_pending,
+                "lead_form.speaker.pending": self.speaker_pending,
+                "lead_form.planner.active": self._planner_active,
+                "lead_form.speaker.active": self._speaker_active,
+                "lead_form.research.queued": queued,
+                "lead_form.research.running": running,
+                "lead_form.research.unconsumed": unconsumed,
+            }
+
+            if self.reconciliation_attempted:
+                self.waiting_for_user = True
+                reconciliation = self._finish_reconciliation_locked(
+                    "forced_user_handoff"
+                )
+                force_user_handoff = True
+            else:
+                self.reconciliation_attempted = True
+                self.planner_trigger = "reconciliation"
+                self.planner_pending = True
+                self._reconciliation_id = str(uuid4())
+                self._reconciliation_started_at = monotonic()
+                detection_attributes["lead_form.reconciliation.id"] = (
+                    self._reconciliation_id
+                )
+                schedule_reconciliation = True
+
+        quiescence_detections.add(
+            1,
+            {
+                "source": source,
+                "reconciliation_attempted": str(
+                    detection_attributes[
+                        "lead_form.quiescence.reconciliation_attempted"
+                    ]
+                ).lower(),
+            },
+        )
+        with tracer.start_as_current_span(
+            "lead_form.quiescence.detected",
+            attributes=detection_attributes,
+        ) as span:
+            span.add_event(
+                "reconciliation.scheduled"
+                if schedule_reconciliation
+                else "user_handoff.forced"
+            )
+            if schedule_reconciliation:
+                span_context = span.get_span_context()
+                async with self._state_lock:
+                    if self.reconciliation_attempted:
+                        self._reconciliation_link = span_context
+
+        if schedule_reconciliation:
+            self._planner_wakeup.set()
+        if force_user_handoff:
+            self._record_reconciliation_outcome(reconciliation)
+            await self._outputs.put(
+                SystemOutput(kind="state", expects_reply=True)
+            )
+
+    def _clear_reconciliation_locked(self) -> None:
+        self._reconciliation_id = None
+        self._reconciliation_started_at = None
+        self._reconciliation_link = None
+
+    def _finish_reconciliation_locked(
+        self, outcome: str
+    ) -> dict[str, Any] | None:
+        if not self.reconciliation_attempted:
+            return None
+
+        reconciliation = {
+            "id": self._reconciliation_id,
+            "started_at": self._reconciliation_started_at,
+            "link": self._reconciliation_link,
+            "outcome": outcome,
+        }
+        self.reconciliation_attempted = False
+        self._clear_reconciliation_locked()
+        return reconciliation
+
+    def _record_reconciliation_outcome(
+        self, reconciliation: dict[str, Any] | None
+    ) -> None:
+        if reconciliation is None:
+            return
+
+        outcome = str(reconciliation["outcome"])
+        started_at = reconciliation["started_at"]
+        duration = monotonic() - started_at if started_at is not None else None
+        link = reconciliation["link"]
+        links = [Link(link)] if link is not None and link.is_valid else []
+        attributes: dict[str, Any] = {
+            SpanAttributes.SESSION_ID: self.session_id,
+            "lead_form.reconciliation.outcome": outcome,
+        }
+        if reconciliation["id"] is not None:
+            attributes["lead_form.reconciliation.id"] = reconciliation["id"]
+        if duration is not None:
+            attributes["lead_form.reconciliation.duration_seconds"] = duration
+
+        reconciliation_outcomes.add(1, {"outcome": outcome})
+        if duration is not None:
+            reconciliation_duration.record(duration, {"outcome": outcome})
+        with tracer.start_as_current_span(
+            "lead_form.reconciliation.outcome",
+            links=links,
+            attributes=attributes,
+        ):
+            pass
 
     async def close(self) -> None:
         """Gracefully stop at a planner/speaker cycle boundary."""
@@ -251,10 +436,13 @@ class AgentSystem:
 
     async def run_research(self, target: str) -> str:
         dispatch_ctx = trace.get_current_span().get_span_context()
+        reconciliation = None
         async with self._state_lock:
             job = ResearchJob(id=str(uuid4()), target=target)
             self.research_jobs.append(job)
+            reconciliation = self._finish_reconciliation_locked("research_started")
         self._start_research(job.id, dispatch_ctx)
+        self._record_reconciliation_outcome(reconciliation)
         return (
             f"Research dispatched for '{target}'; result will arrive in a later cycle."
         )
@@ -307,7 +495,14 @@ class AgentSystem:
                 if self._stopped:
                     return
                 async with self._planner_cycle_lock:
-                    await self._planner_cycle()
+                    async with self._state_lock:
+                        self._planner_active = True
+                    try:
+                        await self._planner_cycle()
+                    finally:
+                        async with self._state_lock:
+                            self._planner_active = False
+                await self._check_quiescence("planner_cycle")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -318,6 +513,8 @@ class AgentSystem:
             if not self.planner_pending:
                 return
             self.planner_pending = False
+            trigger = self.planner_trigger
+            self.planner_trigger = "normal"
             dialogue_end = len(self.dialogue)
             new_lines = list(self.dialogue[self.planner_sent : dialogue_end])
             findings = sorted(
@@ -329,21 +526,50 @@ class AgentSystem:
                 key=lambda job: job.completion_order or 0,
             )
             history = list(self.planner_history)
+            transcript = render_dialogue(self.dialogue)
+            plan = self.buffer
+            research_state = [
+                {
+                    "target": job.target,
+                    "status": job.status,
+                    "consumed": job.consumed,
+                }
+                for job in self.research_jobs
+            ]
+            reconciliation_link = self._reconciliation_link
+            reconciliation_id = self._reconciliation_id
 
-        parts = []
-        if new_lines:
-            parts.append("New in the conversation:\n" + render_dialogue(new_lines))
-        if findings:
-            parts.append(
-                "New research results:\n\n"
-                + "\n\n".join(self._render_research(job) for job in findings)
-            )
-        if not parts:
-            parts.append(
-                "Nothing new arrived. Re-check the plan and decide the next step."
-            )
+        if trigger == "reconciliation":
+            parts = [
+                RECONCILE_HINT,
+                "Conversation:\n" + (transcript or "(empty)"),
+                "Current plan:\n" + (plan or "(empty)"),
+                "Authoritative research job state:\n"
+                + json.dumps(research_state, indent=2),
+            ]
+        else:
+            parts = []
+            if new_lines:
+                parts.append(
+                    "New in the conversation:\n" + render_dialogue(new_lines)
+                )
+            if findings:
+                parts.append(
+                    "New research results:\n\n"
+                    + "\n\n".join(self._render_research(job) for job in findings)
+                )
+            if not parts:
+                parts.append(
+                    "Nothing new arrived. Re-check the plan and decide the next step."
+                )
 
-        result = await self._call_planner("\n\n".join(parts), history)
+        result = await self._call_planner(
+            "\n\n".join(parts),
+            history,
+            trigger=trigger,
+            reconciliation_link=reconciliation_link,
+            reconciliation_id=reconciliation_id,
+        )
         finding_ids = {job.id for job in findings}
         async with self._state_lock:
             self.planner_history = result.all_messages()
@@ -372,15 +598,39 @@ class AgentSystem:
             result = await self._call_planner(
                 AUDIT_FEEDBACK.format(issues=audit.output.issues),
                 list(self.planner_history),
+                trigger=trigger,
+                reconciliation_link=reconciliation_link,
+                reconciliation_id=reconciliation_id,
             )
             async with self._state_lock:
                 self.planner_history = result.all_messages()
                 self.speaker_pending = True
             self._speaker_wakeup.set()
 
-    async def _call_planner(self, prompt: str, history: list[ModelMessage]) -> Any:
+    async def _call_planner(
+        self,
+        prompt: str,
+        history: list[ModelMessage],
+        *,
+        trigger: str = "normal",
+        reconciliation_link: Any | None = None,
+        reconciliation_id: str | None = None,
+    ) -> Any:
+        links = (
+            [Link(reconciliation_link)]
+            if reconciliation_link is not None and reconciliation_link.is_valid
+            else []
+        )
+        attributes: dict[str, Any] = {
+            SpanAttributes.SESSION_ID: self.session_id,
+            "lead_form.planner.trigger": trigger,
+        }
+        if reconciliation_id is not None:
+            attributes["lead_form.reconciliation.id"] = reconciliation_id
         with tracer.start_as_current_span(
-            "planner", attributes={SpanAttributes.SESSION_ID: self.session_id}
+            "planner",
+            links=links,
+            attributes=attributes,
         ):
             return await planning_agent.run(
                 prompt,
@@ -409,7 +659,14 @@ class AgentSystem:
                 if self._stopped:
                     return
                 async with self._speaker_cycle_lock:
-                    await self._speaker_cycle()
+                    async with self._state_lock:
+                        self._speaker_active = True
+                    try:
+                        await self._speaker_cycle()
+                    finally:
+                        async with self._state_lock:
+                            self._speaker_active = False
+                await self._check_quiescence("speaker_cycle")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -426,6 +683,11 @@ class AgentSystem:
             dialogue_end = len(self.dialogue)
             new_lines = list(self.dialogue[self.speaker_sent : dialogue_end])
             history = list(self.speaker_history)
+            speaker_trigger = (
+                "reconciliation" if self.reconciliation_attempted else "normal"
+            )
+            reconciliation_link = self._reconciliation_link
+            reconciliation_id = self._reconciliation_id
 
         prompt = (
             "The plan changed. Decide the single next thing to say to the user, "
@@ -434,8 +696,20 @@ class AgentSystem:
         if new_lines:
             prompt += "\n\nNew since your last check:\n" + render_dialogue(new_lines)
 
+        attributes: dict[str, Any] = {
+            SpanAttributes.SESSION_ID: self.session_id,
+            "lead_form.chat.trigger": speaker_trigger,
+        }
+        if reconciliation_id is not None:
+            attributes["lead_form.reconciliation.id"] = reconciliation_id
         with tracer.start_as_current_span(
-            "chat", attributes={SpanAttributes.SESSION_ID: self.session_id}
+            "chat",
+            links=(
+                [Link(reconciliation_link)]
+                if reconciliation_link is not None and reconciliation_link.is_valid
+                else []
+            ),
+            attributes=attributes,
         ):
             result = await user_agent.run(
                 prompt,
@@ -445,6 +719,7 @@ class AgentSystem:
             )
 
         out = result.output
+        reconciliation = None
         async with self._state_lock:
             self.speaker_history = result.all_messages()
             self.speaker_sent = dialogue_end
@@ -454,6 +729,9 @@ class AgentSystem:
                 )
                 if out.expects_reply:
                     self.waiting_for_user = True
+                    reconciliation = self._finish_reconciliation_locked(
+                        "waiting_for_user"
+                    )
 
         if out.speak and out.message.strip():
             await self._outputs.put(
@@ -463,6 +741,7 @@ class AgentSystem:
                     expects_reply=out.expects_reply,
                 )
             )
+        self._record_reconciliation_outcome(reconciliation)
 
     def _start_research(self, job_id: str, dispatch_ctx: Any | None = None) -> None:
         if job_id in self._research_tasks:
@@ -550,10 +829,13 @@ class AgentSystem:
         return self._closing or self.is_done or self.failure is not None
 
     async def _complete(self, note: str) -> None:
+        reconciliation = None
         async with self._state_lock:
             self.is_done = True
             self.done_note = note
             final_plan = self.buffer
+            reconciliation = self._finish_reconciliation_locked("completed")
+        self._record_reconciliation_outcome(reconciliation)
         self._done.set()
         self._planner_wakeup.set()
         self._speaker_wakeup.set()
@@ -563,8 +845,11 @@ class AgentSystem:
 
     async def _fail(self, source: str, exc: BaseException) -> None:
         error = f"{source} failed: {exc}"
+        reconciliation = None
         async with self._state_lock:
             self.failure = error
+            reconciliation = self._finish_reconciliation_locked("failed")
+        self._record_reconciliation_outcome(reconciliation)
         self._done.set()
         self._planner_wakeup.set()
         self._speaker_wakeup.set()
