@@ -1,13 +1,22 @@
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
+from dotenv import load_dotenv
 from fastapi import FastAPI
 
-app = FastAPI()
+from agent.telemetry import configure_telemetry
+
+load_dotenv()
+configure_telemetry()
+
+from agent.api import router, session_registry
 
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    yield
+    await session_registry.close()
 
 
-@app.get("/items/{item_id}")
-def read_item(item_id: int, q: str | None = None):
-    return {"item_id": item_id, "q": q}
+app = FastAPI(lifespan=lifespan)
+app.include_router(router)

@@ -26,6 +26,7 @@ from pydantic_core import to_jsonable_python
 
 from .models import (
     AuditResult,
+    ConversationState,
     DialogueMessage,
     NextMessage,
     PlanStatus,
@@ -119,6 +120,20 @@ class AgentSystem:
     @classmethod
     def deserialize(cls, value: str) -> AgentSystem:
         return cls(json.loads(value))
+
+    async def conversation_state(self) -> ConversationState:
+        async with self._state_lock:
+            return ConversationState(
+                dialogue=tuple(
+                    DialogueMessage(role=message.role, content=message.content)
+                    for message in self.dialogue
+                ),
+                waiting_for_user=self.waiting_for_user,
+                is_done=self.is_done,
+                done_note=self.done_note,
+                final_plan=self.buffer if self.is_done else "",
+                failure=self.failure,
+            )
 
     async def serialize(self) -> str:
         """Return a safe snapshot at a planner/speaker cycle boundary."""

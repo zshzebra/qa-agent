@@ -46,6 +46,16 @@ class DialogueMessage:
         return f"{label}: {self.content}"
 
 
+@dataclass
+class ConversationState:
+    dialogue: tuple[DialogueMessage, ...]
+    waiting_for_user: bool
+    is_done: bool
+    done_note: str
+    final_plan: str
+    failure: str | None
+
+
 def render_dialogue(messages: list[DialogueMessage]) -> str:
     return "\n".join(message.for_agent() for message in messages)
 

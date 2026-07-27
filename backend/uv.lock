@@ -257,10 +257,12 @@ dependencies = [
     { name = "arize-phoenix" },
     { name = "exa-py" },
     { name = "fastapi", extra = ["standard"] },
+    { name = "httpx" },
     { name = "openinference-instrumentation-pydantic-ai" },
     { name = "opentelemetry-exporter-otlp" },
     { name = "opentelemetry-sdk" },
     { name = "pydantic-ai" },
+    { name = "rich" },
 ]
 
 [package.metadata]
@@ -268,10 +270,12 @@ requires-dist = [
     { name = "arize-phoenix", specifier = ">=17.26.0" },
     { name = "exa-py", specifier = ">=2.16.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.139.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "openinference-instrumentation-pydantic-ai", specifier = ">=0.1.17" },
     { name = "opentelemetry-exporter-otlp", specifier = ">=1.42.1" },
     { name = "opentelemetry-sdk", specifier = ">=1.42.1" },
     { name = "pydantic-ai", specifier = ">=2.9.0" },
+    { name = "rich", specifier = ">=14.3.3" },
 ]
 
 [[package]]
