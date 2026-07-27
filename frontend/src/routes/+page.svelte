@@ -2,6 +2,7 @@
 	import { createSessionClient } from '$lib';
 	import Button from '$lib/components/ui/button/button.svelte';
 	import Input from '$lib/components/ui/input/input.svelte';
+	import Skeleton from '$lib/components/ui/skeleton/skeleton.svelte';
 	import DOMPurify from 'dompurify';
 	import { marked } from 'marked';
 
@@ -33,6 +34,17 @@
 						{@html DOMPurify.sanitize(marked.parse(item.content) as string)}
 					</div>
 				{/each}
+				{#if $agent.session.status == 'working'}
+					<div class="flex flex-col gap-2">
+						<!-- NOTE: Slightly overkill way to have the two skeleton loaders -->
+						<!-- different widths on _practically_ all devices -->
+						<Skeleton class="h-4 max-w-48 w-full" />
+						<div class="flex flex-row flex-nowrap">
+							<Skeleton class="h-4 max-w-40 w-full" />
+							<div class="w-8"></div>
+						</div>
+					</div>
+				{/if}
 			{/if}
 		</div>
 	</div>
