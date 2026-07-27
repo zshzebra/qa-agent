@@ -49,8 +49,10 @@
 		</div>
 	</div>
 
-	<form onsubmit={handleSubmit} class="flex flex-row">
-		<Input bind:value={message} placeholder="Amazo..." />
-		<Button disabled={$agent.sending}>Send</Button>
-	</form>
+	{#if $agent.session?.status != 'completed'}
+		<form onsubmit={handleSubmit} class="flex flex-row">
+			<Input bind:value={message} placeholder="Amazo..." />
+			<Button disabled={$agent.sending}>Send</Button>
+		</form>
+	{/if}
 </div>
