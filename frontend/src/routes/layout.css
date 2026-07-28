@@ -1,7 +1,8 @@
 @import 'tailwindcss';
-@import "tw-animate-css";
-@import "shadcn-svelte/tailwind.css";
-@import "@fontsource-variable/noto-sans";
+@import 'tw-animate-css';
+@import 'shadcn-svelte/tailwind.css';
+@import '@fontsource-variable/noto-sans';
+@import '../lib/styles/chat-prose.css';
 
 @custom-variant dark (&:is(.dark *));
 @plugin '@tailwindcss/forms';

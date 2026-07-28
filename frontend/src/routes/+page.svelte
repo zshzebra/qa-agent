@@ -26,7 +26,7 @@
 
 <div class="max-w-prose p-6 h-screen flex flex-col mx-auto">
 	<div class="h-full overflow-y-scroll">
-		<div class="flex flex-col gap-4">
+		<div class="flex flex-col gap-4 chat-prose">
 			{#if $agent.session}
 				{#each $agent.session.messages as item, index (index)}
 					<div class={item.role == 'user' ? 'p-2 bg-accent text-right w-max ml-auto' : null}>
