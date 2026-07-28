@@ -1,0 +1,9 @@
+Target result: `{{ target.name }}`
+{% if target.description %}
+{{ target.description }}
+{% endif %}
+
+Fields to resolve:
+{% for field in target.fields -%}
+- `{{ field.name }}` — {{ field.description }}{{ " (optional)" if not field.required else "" }}{{ "\n" }}
+{%- endfor %}

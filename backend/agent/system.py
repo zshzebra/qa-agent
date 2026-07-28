@@ -13,6 +13,7 @@ from opentelemetry import context as otel_context
 from opentelemetry import metrics
 from opentelemetry import trace
 from opentelemetry.trace import Link
+from pydantic import BaseModel
 from pydantic_ai import (
     Agent,
     AgentCapability,
@@ -37,6 +38,8 @@ from .models import (
     SystemOutput,
     render_dialogue,
 )
+from .prompts import PromptRenderer
+from .target import TargetContext
 from .tools.buffer import BufferToolset
 from .tools.exa import ExaWithoutCitation
 
@@ -64,15 +67,6 @@ reconciliation_duration = meter.create_histogram(
     description="Time from quiescence detection to a live session outcome.",
 )
 
-def load_instructions(agent: str) -> str:
-    with open(
-        os.path.join(os.path.dirname(__file__), f"instructions/{agent}.md"),
-        "r",
-        encoding="utf-8",
-    ) as file:
-        return file.read()
-
-
 def instrumented_capabilities(extra: list[AgentCapability]) -> list[AgentCapability]:
     return [Instrumentation(InstrumentationSettings(version=2)), *extra]
 
@@ -84,7 +78,7 @@ def tool_output[OutputT](t: type[OutputT]) -> ToolOutput[OutputT]:
 MAX_AUDIT_RETRIES = 2
 
 
-class AgentSystem[OutputT]:
+class AgentSystem[OutputT: BaseModel]:
     def __init__(
         self,
         *,
@@ -96,11 +90,17 @@ class AgentSystem[OutputT]:
         state: dict[str, Any] | None = None,
     ) -> None:
         self.output_type = output_type
+        self.target = TargetContext.from_model(output_type)
+        self.prompts = PromptRenderer()
         state = state or {}
 
         # Serializable logical state.
         self.session_id: str = state.get("session_id", str(uuid4()))
-        self.buffer: str = state.get("buffer", "")
+        self.buffer: str = (
+            state["buffer"]
+            if "buffer" in state
+            else self.prompts.render("initial_buffer.md.j2", target=self.target)
+        )
         self.dialogue: list[DialogueMessage] = [
             DialogueMessage(**message) for message in state.get("dialogue", [])
         ]
@@ -145,8 +145,6 @@ class AgentSystem[OutputT]:
         self._started = False
         self._closing = False
 
-        self._audit_feedback = load_instructions("audit_feedback")
-        self._reconcile_hint = load_instructions("reconcile")
         self._create_agents(
             planner_model=planner_model,
             speaker_model=speaker_model,
@@ -167,9 +165,16 @@ class AgentSystem[OutputT]:
         self.planning_agent = Agent(
             planner_model,
             output_type=tool_output(PlanStatus),
-            instructions=load_instructions("planner"),
+            instructions=self.prompts.render(
+                "planner.md.j2",
+                target=self.target,
+            ),
             deps_type=AgentSystem,
-            toolsets=[BufferToolset()],
+            toolsets=[
+                BufferToolset(
+                    instructions=self.prompts.render("buffer_tools.md.j2"),
+                )
+            ],
             capabilities=[Instrumentation(InstrumentationSettings(version=2))],
             retries=3,
         )
@@ -180,7 +185,10 @@ class AgentSystem[OutputT]:
 
         self.research_agent = Agent(
             researcher_model,
-            instructions=load_instructions("research"),
+            instructions=self.prompts.render(
+                "researcher.md.j2",
+                target=self.target,
+            ),
             output_type=tool_output(ResearchOutput),
             toolsets=[self._exa_without_citation.exa_toolset],
             capabilities=instrumented_capabilities(
@@ -192,7 +200,10 @@ class AgentSystem[OutputT]:
         self.auditor_agent = Agent(
             auditor_model,
             output_type=tool_output(AuditResult),
-            instructions=load_instructions("auditor"),
+            instructions=self.prompts.render(
+                "auditor.md.j2",
+                target=self.target,
+            ),
             capabilities=instrumented_capabilities([]),
             retries=3,
         )
@@ -201,7 +212,10 @@ class AgentSystem[OutputT]:
             speaker_model,
             deps_type=AgentSystem,
             output_type=ToolOutput(NextMessage, name="NextMessage"),
-            instructions=load_instructions("user"),
+            instructions=self.prompts.render(
+                "speaker.md.j2",
+                target=self.target,
+            ),
             capabilities=instrumented_capabilities([]),
             retries=3,
         )
@@ -230,12 +244,10 @@ class AgentSystem[OutputT]:
     def _current_plan_instruction(
         self, ctx: RunContext[AgentSystem[Any]]
     ) -> str:
-        if not ctx.deps.buffer:
-            return (
-                "No plan yet. Warmly greet the user and ask which company they "
-                "work for. Ask only that."
-            )
-        return f"Current plan:\n{ctx.deps.buffer}"
+        return self.prompts.render(
+            "speaker_context.md.j2",
+            buffer=ctx.deps.buffer,
+        )
 
     async def _spawn_research_agent(
         self, ctx: RunContext[AgentSystem[Any]], target: str
@@ -538,8 +550,9 @@ class AgentSystem[OutputT]:
             reconciliation = self._finish_reconciliation_locked("research_started")
         self._start_research(job.id, dispatch_ctx)
         self._record_reconciliation_outcome(reconciliation)
-        return (
-            f"Research dispatched for '{target}'; result will arrive in a later cycle."
+        return self.prompts.render(
+            "research_dispatched.md.j2",
+            research_target=target,
         )
 
     def _spawn(self, coroutine: Any, name: str, job_id: str | None = None) -> None:
@@ -563,8 +576,10 @@ class AgentSystem[OutputT]:
                 "chat", attributes={SpanAttributes.SESSION_ID: self.session_id}
             ):
                 opener = await self.speaker_agent.run(
-                    "Greet the user warmly in one line and ask which company they "
-                    "work for. Ask only that, and set speak=true.",
+                    self.prompts.render(
+                        "opener.md.j2",
+                        target=self.target,
+                    ),
                     deps=self,
                     conversation_id=self.session_id,
                 )
@@ -635,31 +650,22 @@ class AgentSystem[OutputT]:
             reconciliation_id = self._reconciliation_id
 
         if trigger == "reconciliation":
-            parts = [
-                self._reconcile_hint,
-                "Conversation:\n" + (transcript or "(empty)"),
-                "Current plan:\n" + (plan or "(empty)"),
-                "Authoritative research job state:\n"
-                + json.dumps(research_state, indent=2),
-            ]
+            prompt = self.prompts.render(
+                "reconcile.md.j2",
+                target=self.target,
+                conversation=transcript,
+                buffer=plan,
+                research_state=research_state,
+            )
         else:
-            parts = []
-            if new_lines:
-                parts.append(
-                    "New in the conversation:\n" + render_dialogue(new_lines)
-                )
-            if findings:
-                parts.append(
-                    "New research results:\n\n"
-                    + "\n\n".join(self._render_research(job) for job in findings)
-                )
-            if not parts:
-                parts.append(
-                    "Nothing new arrived. Re-check the plan and decide the next step."
-                )
+            prompt = self.prompts.render(
+                "planner_turn.md.j2",
+                new_dialogue=render_dialogue(new_lines),
+                findings=[self._render_research(job) for job in findings],
+            )
 
         result = await self._call_planner(
-            "\n\n".join(parts),
+            prompt,
             history,
             trigger=trigger,
             reconciliation_link=reconciliation_link,
@@ -691,7 +697,10 @@ class AgentSystem[OutputT]:
                 return
 
             result = await self._call_planner(
-                self._audit_feedback.format(issues=audit.output.issues),
+                self.prompts.render(
+                    "audit_feedback.md.j2",
+                    issues=audit.output.issues,
+                ),
                 list(self.planner_history),
                 trigger=trigger,
                 reconciliation_link=reconciliation_link,
@@ -742,7 +751,12 @@ class AgentSystem[OutputT]:
             "auditor", attributes={SpanAttributes.SESSION_ID: self.session_id}
         ):
             return await self.auditor_agent.run(
-                f"Conversation:\n{transcript}\n\nPlan:\n{plan}",
+                self.prompts.render(
+                    "audit_request.md.j2",
+                    target=self.target,
+                    conversation=transcript,
+                    buffer=plan,
+                ),
                 conversation_id=self.session_id,
             )
 
@@ -784,12 +798,10 @@ class AgentSystem[OutputT]:
             reconciliation_link = self._reconciliation_link
             reconciliation_id = self._reconciliation_id
 
-        prompt = (
-            "The plan changed. Decide the single next thing to say to the user, "
-            "or stay silent."
+        prompt = self.prompts.render(
+            "speaker_turn.md.j2",
+            new_dialogue=render_dialogue(new_lines),
         )
-        if new_lines:
-            prompt += "\n\nNew since your last check:\n" + render_dialogue(new_lines)
 
         attributes: dict[str, Any] = {
             SpanAttributes.SESSION_ID: self.session_id,
@@ -875,14 +887,19 @@ class AgentSystem[OutputT]:
                 },
             ):
                 run = await self.research_agent.run(
-                    f"Please find the following information: {target}",
+                    self.prompts.render(
+                        "research_request.md.j2",
+                        research_target=target,
+                    ),
                     conversation_id=self.session_id,
                 )
 
             out = run.output
-            message = (
-                f"Research result for '{target}':\n"
-                f"answer: {out.answer}\nreasoning: {out.reasoning}"
+            message = self.prompts.render(
+                "research_result.md.j2",
+                research_target=target,
+                answer=out.answer,
+                reasoning=out.reasoning,
             )
             async with self._state_lock:
                 job = self._job(job_id)
@@ -913,11 +930,14 @@ class AgentSystem[OutputT]:
     def _job(self, job_id: str) -> ResearchJob:
         return next(job for job in self.research_jobs if job.id == job_id)
 
-    @staticmethod
-    def _render_research(job: ResearchJob) -> str:
+    def _render_research(self, job: ResearchJob) -> str:
         if job.status == "completed":
             return job.result or ""
-        return f"Research for '{job.target}' failed: {job.error}"
+        return self.prompts.render(
+            "research_failed.md.j2",
+            research_target=job.target,
+            error=job.error,
+        )
 
     @property
     def _stopped(self) -> bool:

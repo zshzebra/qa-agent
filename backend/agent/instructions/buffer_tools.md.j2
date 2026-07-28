@@ -1,0 +1,10 @@
+You have CRUD access to one flexible text buffer.
+
+- `read_buffer` returns its contents, optionally over a line range, with line
+  numbers.
+- `write_buffer` sets the entire buffer only when it is empty.
+- `edit_buffer` replaces one exact, uniquely matching substring.
+- `clear_buffer` empties the buffer.
+
+Prefer `edit_buffer` for incremental changes. Use `write_buffer` only after the
+buffer has been cleared or when initializing an empty buffer.

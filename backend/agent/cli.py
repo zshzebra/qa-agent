@@ -13,8 +13,8 @@ async def main() -> None:
 
     configure_telemetry()
 
-    from agent.models import PlanStatus
     from agent.system import AgentSystem
+    from onboarding import ExampleCompanyOnboarding
 
     model = GoogleModel("gemini-3.1-flash-lite-preview")
     session_file = Path("session.json")
@@ -23,7 +23,7 @@ async def main() -> None:
     if restored:
         system = AgentSystem.deserialize(
             session_file.read_text(encoding="utf-8"),
-            output_type=PlanStatus,
+            output_type=ExampleCompanyOnboarding,
             planner_model=model,
             speaker_model=model,
             researcher_model=model,
@@ -37,7 +37,7 @@ async def main() -> None:
                 print(message.content)
     else:
         system = AgentSystem(
-            output_type=PlanStatus,
+            output_type=ExampleCompanyOnboarding,
             planner_model=model,
             speaker_model=model,
             researcher_model=model,

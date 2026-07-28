@@ -7,6 +7,7 @@ dependencies = [
     "exa-py>=2.16.0",
     "fastapi[standard]>=0.139.0",
     "httpx>=0.28.1",
+    "jinja2>=3.1.6",
     "openinference-instrumentation-pydantic-ai>=0.1.17",
     "opentelemetry-exporter-otlp>=1.42.1",
     "opentelemetry-sdk>=1.42.1",

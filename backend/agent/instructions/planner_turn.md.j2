@@ -1,0 +1,15 @@
+{% if new_dialogue %}
+New in the conversation:
+{{ new_dialogue }}
+{% endif %}
+{% if findings %}
+
+New research results:
+{% for finding in findings %}
+
+{{ finding }}
+{% endfor %}
+{% endif %}
+{% if not new_dialogue and not findings %}
+Nothing new arrived. Re-check the working buffer and decide the next step.
+{% endif %}

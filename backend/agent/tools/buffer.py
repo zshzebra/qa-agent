@@ -9,8 +9,9 @@ class HasBuffer(Protocol):
 
 
 class BufferToolset(FunctionToolset[HasBuffer]):
-    def __init__(self, *, context_lines: int = 2) -> None:
+    def __init__(self, *, instructions: str, context_lines: int = 2) -> None:
         super().__init__()
+        self.tool_instructions = instructions
         self.context_lines = context_lines
 
         self.add_function(self.read_buffer, retries=3)
@@ -20,20 +21,7 @@ class BufferToolset(FunctionToolset[HasBuffer]):
 
         @self.instructions
         def _(ctx: RunContext[HasBuffer]) -> str:
-            return (
-                "You have CRUD access to a single text buffer.\n"
-                "- read_buffer returns the contents (optionally a line range) with "
-                "line numbers.\n"
-                "- write_buffer sets the whole buffer, but only when it is empty; "
-                "if it already has content it will fail, so use edit_buffer "
-                "instead.\n"
-                "- edit_buffer replaces an exact substring with a new value — the "
-                "target must appear exactly once, so include enough surrounding "
-                "text to make it unique, otherwise the edit is rejected.\n"
-                "- clear_buffer empties the buffer.\n"
-                "Prefer edit_buffer for incremental changes; use write_buffer only "
-                "for the initial fill."
-            )
+            return self.tool_instructions
 
     def read_buffer(
         self, ctx: RunContext[HasBuffer], start: int = 1, end: int | None = None

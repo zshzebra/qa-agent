@@ -1,0 +1,38 @@
+Perform a careful reconciliation of the current conversation and working
+buffer.
+
+The target is:
+
+{% include "_target.md.j2" %}
+
+All work scheduled before this planner turn has finished: no research job is
+queued or running, no research result is waiting to be processed, and no other
+background work will continue unless you start it in this turn.
+
+First establish exactly where the task stands:
+
+1. Review the latest user input and verify that every meaningful answer,
+   correction, uncertainty, refusal, acknowledgement, or question is reflected
+   in the buffer.
+2. Review every unresolved field and decide whether known information supports
+   useful, non-duplicate research.
+3. Identify findings needing confirmation and any specific fact, decision, or
+   disambiguation only the user can provide.
+4. Decide whether the latest assistant message already gives the user the
+   correct next action. Do not repeat a sufficient handoff.
+
+Then leave the task able to advance: dispatch useful research, write a
+purposeful `Next message to user` note, stay silent when the existing handoff is
+sufficient, or finish only when the normal completion requirements are met.
+Merely editing the buffer is not sufficient if it leaves no research running,
+does not return the conversational floor to the user, and does not complete the
+task.
+
+Conversation:
+{{ conversation or "(empty)" }}
+
+Current working buffer:
+{{ buffer or "(empty)" }}
+
+Authoritative research job state:
+{{ research_state | tojson(indent=2) }}

@@ -10,7 +10,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from pydantic_ai.models.google import GoogleModel
 
-from .models import PlanStatus
+from onboarding import ExampleCompanyOnboarding
+
 from .system import AgentSystem
 
 
@@ -126,7 +127,7 @@ class SessionRegistry:
             if supervisor is None:
                 supervisor = SessionSupervisor(
                     AgentSystem(
-                        output_type=PlanStatus,
+                        output_type=ExampleCompanyOnboarding,
                         planner_model=self._model,
                         speaker_model=self._model,
                         researcher_model=self._model,
