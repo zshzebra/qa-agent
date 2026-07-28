@@ -22,7 +22,7 @@ from pydantic_ai import (
     ToolOutput,
 )
 from pydantic_ai.capabilities import Instrumentation
-from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.models import Model
 from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_core import to_jsonable_python
 
@@ -64,12 +64,6 @@ reconciliation_duration = meter.create_histogram(
     description="Time from quiescence detection to a live session outcome.",
 )
 
-exa_without_citation = ExaWithoutCitation(require_env("EXA_API_KEY"))
-smart_model = GoogleModel("gemini-3.1-flash-lite-preview")
-research_model = smart_model
-auditor_model = smart_model
-
-
 def load_instructions(agent: str) -> str:
     with open(
         os.path.join(os.path.dirname(__file__), f"instructions/{agent}.md"),
@@ -88,12 +82,20 @@ def tool_output[OutputT](t: type[OutputT]) -> ToolOutput[OutputT]:
 
 
 MAX_AUDIT_RETRIES = 2
-AUDIT_FEEDBACK = load_instructions("audit_feedback")
-RECONCILE_HINT = load_instructions("reconcile")
 
 
-class AgentSystem:
-    def __init__(self, state: dict[str, Any] | None = None) -> None:
+class AgentSystem[OutputT]:
+    def __init__(
+        self,
+        *,
+        output_type: type[OutputT],
+        planner_model: Model,
+        speaker_model: Model,
+        researcher_model: Model,
+        auditor_model: Model,
+        state: dict[str, Any] | None = None,
+    ) -> None:
+        self.output_type = output_type
         state = state or {}
 
         # Serializable logical state.
@@ -143,9 +145,102 @@ class AgentSystem:
         self._started = False
         self._closing = False
 
+        self._audit_feedback = load_instructions("audit_feedback")
+        self._reconcile_hint = load_instructions("reconcile")
+        self._create_agents(
+            planner_model=planner_model,
+            speaker_model=speaker_model,
+            researcher_model=researcher_model,
+            auditor_model=auditor_model,
+        )
+
+    def _create_agents(
+        self,
+        *,
+        planner_model: Model,
+        speaker_model: Model,
+        researcher_model: Model,
+        auditor_model: Model,
+    ) -> None:
+        self._exa_without_citation = ExaWithoutCitation(require_env("EXA_API_KEY"))
+
+        self.planning_agent = Agent(
+            planner_model,
+            output_type=tool_output(PlanStatus),
+            instructions=load_instructions("planner"),
+            deps_type=AgentSystem,
+            toolsets=[BufferToolset()],
+            capabilities=[Instrumentation(InstrumentationSettings(version=2))],
+            retries=3,
+        )
+        self.planning_agent.tool(
+            self._spawn_research_agent,
+            name="spawn_research_agent",
+        )
+
+        self.research_agent = Agent(
+            researcher_model,
+            instructions=load_instructions("research"),
+            output_type=tool_output(ResearchOutput),
+            toolsets=[self._exa_without_citation.exa_toolset],
+            capabilities=instrumented_capabilities(
+                [self._exa_without_citation.exa_hooks]
+            ),
+            retries=3,
+        )
+
+        self.auditor_agent = Agent(
+            auditor_model,
+            output_type=tool_output(AuditResult),
+            instructions=load_instructions("auditor"),
+            capabilities=instrumented_capabilities([]),
+            retries=3,
+        )
+
+        self.speaker_agent = Agent(
+            speaker_model,
+            deps_type=AgentSystem,
+            output_type=ToolOutput(NextMessage, name="NextMessage"),
+            instructions=load_instructions("user"),
+            capabilities=instrumented_capabilities([]),
+            retries=3,
+        )
+        self.speaker_agent.instructions(self._current_plan_instruction)
+
     @classmethod
-    def deserialize(cls, value: str) -> AgentSystem:
-        return cls(json.loads(value))
+    def deserialize(
+        cls,
+        value: str,
+        *,
+        output_type: type[OutputT],
+        planner_model: Model,
+        speaker_model: Model,
+        researcher_model: Model,
+        auditor_model: Model,
+    ) -> AgentSystem[OutputT]:
+        return cls(
+            output_type=output_type,
+            planner_model=planner_model,
+            speaker_model=speaker_model,
+            researcher_model=researcher_model,
+            auditor_model=auditor_model,
+            state=json.loads(value),
+        )
+
+    def _current_plan_instruction(
+        self, ctx: RunContext[AgentSystem[Any]]
+    ) -> str:
+        if not ctx.deps.buffer:
+            return (
+                "No plan yet. Warmly greet the user and ask which company they "
+                "work for. Ask only that."
+            )
+        return f"Current plan:\n{ctx.deps.buffer}"
+
+    async def _spawn_research_agent(
+        self, ctx: RunContext[AgentSystem[Any]], target: str
+    ) -> str:
+        return await ctx.deps.run_research(target)
 
     async def conversation_state(self) -> ConversationState:
         async with self._state_lock:
@@ -467,7 +562,7 @@ class AgentSystem:
             with tracer.start_as_current_span(
                 "chat", attributes={SpanAttributes.SESSION_ID: self.session_id}
             ):
-                opener = await user_agent.run(
+                opener = await self.speaker_agent.run(
                     "Greet the user warmly in one line and ask which company they "
                     "work for. Ask only that, and set speak=true.",
                     deps=self,
@@ -541,7 +636,7 @@ class AgentSystem:
 
         if trigger == "reconciliation":
             parts = [
-                RECONCILE_HINT,
+                self._reconcile_hint,
                 "Conversation:\n" + (transcript or "(empty)"),
                 "Current plan:\n" + (plan or "(empty)"),
                 "Authoritative research job state:\n"
@@ -596,7 +691,7 @@ class AgentSystem:
                 return
 
             result = await self._call_planner(
-                AUDIT_FEEDBACK.format(issues=audit.output.issues),
+                self._audit_feedback.format(issues=audit.output.issues),
                 list(self.planner_history),
                 trigger=trigger,
                 reconciliation_link=reconciliation_link,
@@ -632,7 +727,7 @@ class AgentSystem:
             links=links,
             attributes=attributes,
         ):
-            return await planning_agent.run(
+            return await self.planning_agent.run(
                 prompt,
                 message_history=history,
                 deps=self,
@@ -646,7 +741,7 @@ class AgentSystem:
         with tracer.start_as_current_span(
             "auditor", attributes={SpanAttributes.SESSION_ID: self.session_id}
         ):
-            return await auditor_agent.run(
+            return await self.auditor_agent.run(
                 f"Conversation:\n{transcript}\n\nPlan:\n{plan}",
                 conversation_id=self.session_id,
             )
@@ -711,7 +806,7 @@ class AgentSystem:
             ),
             attributes=attributes,
         ):
-            result = await user_agent.run(
+            result = await self.speaker_agent.run(
                 prompt,
                 message_history=history,
                 deps=self,
@@ -779,7 +874,7 @@ class AgentSystem:
                     "research.target": target,
                 },
             ):
-                run = await research_agent.run(
+                run = await self.research_agent.run(
                     f"Please find the following information: {target}",
                     conversation_id=self.session_id,
                 )
@@ -854,52 +949,3 @@ class AgentSystem:
         self._planner_wakeup.set()
         self._speaker_wakeup.set()
         await self._outputs.put(SystemOutput(kind="error", error=error))
-
-
-planning_agent = Agent(
-    smart_model,
-    output_type=tool_output(PlanStatus),
-    instructions=load_instructions("planner"),
-    deps_type=AgentSystem,
-    toolsets=[BufferToolset()],
-    capabilities=[Instrumentation(InstrumentationSettings(version=2))],
-    retries=3,
-)
-
-research_agent = Agent(
-    research_model,
-    instructions=load_instructions("research"),
-    output_type=tool_output(ResearchOutput),
-    toolsets=[exa_without_citation.exa_toolset],
-    capabilities=instrumented_capabilities([exa_without_citation.exa_hooks]),
-    retries=3,
-)
-
-auditor_agent = Agent(
-    auditor_model,
-    output_type=tool_output(AuditResult),
-    instructions=load_instructions("auditor"),
-    capabilities=instrumented_capabilities([]),
-    retries=3,
-)
-
-user_agent = Agent(
-    smart_model,
-    deps_type=AgentSystem,
-    output_type=ToolOutput(NextMessage, name="NextMessage"),
-    instructions=load_instructions("user"),
-    capabilities=instrumented_capabilities([]),
-    retries=3,
-)
-
-
-@user_agent.instructions
-def current_plan(ctx: RunContext[AgentSystem]) -> str:
-    if not ctx.deps.buffer:
-        return "No plan yet. Warmly greet the user and ask which company they work for. Ask only that."
-    return f"Current plan:\n{ctx.deps.buffer}"
-
-
-@planning_agent.tool
-async def spawn_research_agent(ctx: RunContext[AgentSystem], target: str) -> str:
-    return await ctx.deps.run_research(target)

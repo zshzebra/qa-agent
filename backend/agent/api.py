@@ -8,7 +8,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+from pydantic_ai.models.google import GoogleModel
 
+from .models import PlanStatus
 from .system import AgentSystem
 
 
@@ -31,8 +33,8 @@ class SendMessageRequest(BaseModel):
 
 
 class SessionSupervisor:
-    def __init__(self, system: AgentSystem | None = None) -> None:
-        self.system = system or AgentSystem()
+    def __init__(self, system: AgentSystem) -> None:
+        self.system = system
         self._start_lock = asyncio.Lock()
         self._publish_lock = asyncio.Lock()
         self._output_task: asyncio.Task[None] | None = None
@@ -116,12 +118,21 @@ class SessionRegistry:
     def __init__(self) -> None:
         self._supervisors: dict[str, SessionSupervisor] = {}
         self._lock = asyncio.Lock()
+        self._model = GoogleModel("gemini-3.1-flash-lite-preview")
 
     async def get(self, key: str) -> SessionSupervisor:
         async with self._lock:
             supervisor = self._supervisors.get(key)
             if supervisor is None:
-                supervisor = SessionSupervisor()
+                supervisor = SessionSupervisor(
+                    AgentSystem(
+                        output_type=PlanStatus,
+                        planner_model=self._model,
+                        speaker_model=self._model,
+                        researcher_model=self._model,
+                        auditor_model=self._model,
+                    )
+                )
                 self._supervisors[key] = supervisor
         await supervisor.start()
         return supervisor

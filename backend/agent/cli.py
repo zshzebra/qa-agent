@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 from dotenv import load_dotenv
+from pydantic_ai.models.google import GoogleModel
 
 from agent.telemetry import configure_telemetry
 
@@ -12,13 +13,22 @@ async def main() -> None:
 
     configure_telemetry()
 
+    from agent.models import PlanStatus
     from agent.system import AgentSystem
 
+    model = GoogleModel("gemini-3.1-flash-lite-preview")
     session_file = Path("session.json")
     restored = session_file.exists()
 
     if restored:
-        system = AgentSystem.deserialize(session_file.read_text(encoding="utf-8"))
+        system = AgentSystem.deserialize(
+            session_file.read_text(encoding="utf-8"),
+            output_type=PlanStatus,
+            planner_model=model,
+            speaker_model=model,
+            researcher_model=model,
+            auditor_model=model,
+        )
 
         for message in system.dialogue:
             if message.role == "user":
@@ -26,7 +36,13 @@ async def main() -> None:
             else:
                 print(message.content)
     else:
-        system = AgentSystem()
+        system = AgentSystem(
+            output_type=PlanStatus,
+            planner_model=model,
+            speaker_model=model,
+            researcher_model=model,
+            auditor_model=model,
+        )
 
     await system.run()
 
