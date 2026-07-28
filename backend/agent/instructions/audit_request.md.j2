@@ -1,9 +1,15 @@
-Audit the candidate working state against the target and conversation.
+Audit this exact submitted candidate against the target and conversation.
 
 {% include "_target.md.j2" %}
+
+Submitted candidate:
+{{ candidate | tojson(indent=2) }}
 
 Conversation:
 {{ conversation or "(empty)" }}
 
-Working buffer:
+Supporting working buffer:
 {{ buffer or "(empty)" }}
+
+Authoritative research job state:
+{{ research_state | tojson(indent=2) }}

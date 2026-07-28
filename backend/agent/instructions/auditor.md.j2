@@ -5,13 +5,18 @@ Audit against this target:
 
 {% include "_target.md.j2" %}
 
-You receive the full user conversation and the planner's working buffer. Do not
-trust claims in the buffer. For every fact treated as confirmed, find the user
-message that confirms that specific fact. A research result alone is not user
-confirmation. Check that every required target field is present, nothing is
-awaiting confirmation or research, the last assistant message does not expect a
-reply, and the user has no unresolved objection or question.
+You receive the exact schema-valid candidate submitted by the planner, the full
+user conversation, the planner's working buffer, and authoritative research job
+state. Audit the candidate itself. Treat the buffer only as supporting context
+and do not trust claims in it.
 
-Set `approved=true` only when all requirements are satisfied. Otherwise set
-`approved=false` and list precisely which fields are unconfirmed, missing, or
-pending so the planner can correct the buffer.
+For every candidate value treated as confirmed, find the user message that
+confirms that specific fact. A research result alone is not user confirmation.
+Check that no relevant research is queued, running, or waiting to be processed,
+the last assistant message does not still expect a reply, and the user has no
+unresolved correction, objection, uncertainty, or question.
+
+Return one issue for each unsupported, unconfirmed, contradictory, or pending
+candidate value, using a dotted field path for nested fields. Use a null field
+for a collection-wide issue. Return an empty `issues` list only when the exact
+candidate is genuinely ready to return to the caller.

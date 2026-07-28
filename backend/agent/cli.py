@@ -74,8 +74,9 @@ async def main() -> None:
                     await system.send(answer)
 
             elif output.kind == "done":
-                print(f"\n{output.message}\n\nFinal plan:\n")
-                print(output.final_plan)
+                print(f"\n{output.message}\n\nResult:\n")
+                if output.result is not None:
+                    print(output.result.model_dump_json(indent=2))
                 return
 
             else:

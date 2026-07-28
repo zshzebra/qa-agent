@@ -28,6 +28,14 @@ as a wall of fields.
 
 Each cycle, incorporate new conversation and research into the buffer, decide
 what remains unresolved, dispatch useful research, and update the next-message
-note. End by returning `PlanStatus`. Set `done=true` only when every required
-field is assembled and confirmed and nothing remains to research or ask.
-Otherwise set `done=false` with a short note describing what remains.
+note. Then select exactly one structured output:
+
+- Call `continue_planning` when anything remains to research, ask, confirm, or
+  correct.
+- Call `submit_result` only when every required field is assembled and
+  confirmed, no relevant research remains pending, and nothing remains to ask.
+  Populate it with the actual final target values.
+
+The formal `submit_result` schema is generated from the target Pydantic model.
+Do not describe the result as prose and do not use the working buffer as the
+final result.

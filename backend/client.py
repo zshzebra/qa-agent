@@ -20,7 +20,7 @@ class Snapshot(TypedDict):
     status: Literal["working", "waiting_for_user", "completed", "failed"]
     messages: list[Message]
     completion_message: str | None
-    final_plan: str | None
+    result: dict[str, object] | None
     error: str | None
 
 
@@ -89,10 +89,10 @@ async def main(url: str, key: str) -> None:
                 if snapshot["completion_message"]:
                     console.print()
                     console.print(Markdown(snapshot["completion_message"]))
-                if snapshot["final_plan"]:
+                if snapshot["result"] is not None:
                     console.print()
-                    console.rule("Final plan")
-                    console.print(Markdown(snapshot["final_plan"]))
+                    console.rule("Result")
+                    console.print_json(data=snapshot["result"])
                 return
 
             if snapshot["status"] == "waiting_for_user":

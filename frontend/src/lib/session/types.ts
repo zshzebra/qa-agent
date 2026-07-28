@@ -12,7 +12,7 @@ export interface SessionSnapshot {
 	status: SessionStatus;
 	messages: SessionMessage[];
 	completion_message: string | null;
-	final_plan: string | null;
+	result: Record<string, unknown> | null;
 	error: string | null;
 }
 

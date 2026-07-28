@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from pydantic import BaseModel, Field
+
 
 @dataclass
 class ResearchOutput:
@@ -15,24 +17,37 @@ class NextMessage:
     message: str = ""
 
 
-@dataclass
-class PlanStatus:
-    done: bool
-    note: str = ""
+class ContinuePlanning(BaseModel):
+    """End this planner cycle without completing the collection."""
+
+
+class AuditIssue(BaseModel):
+    field: str | None = Field(
+        description=(
+            "The relevant target field, using a dotted path for a nested field, "
+            "or null for a collection-wide issue."
+        )
+    )
+    reason: str = Field(
+        description=(
+            "Why the submitted value is unsupported, unconfirmed, contradictory, "
+            "or otherwise not ready."
+        )
+    )
+
+
+class AuditResult(BaseModel):
+    issues: list[AuditIssue] = Field(
+        description="Empty only when the submitted candidate is fully approved.",
+    )
 
 
 @dataclass
-class AuditResult:
-    approved: bool
-    issues: str = ""
-
-
-@dataclass
-class SystemOutput:
+class SystemOutput[OutputT: BaseModel]:
     kind: Literal["message", "state", "done", "error"]
     message: str = ""
     expects_reply: bool = False
-    final_plan: str = ""
+    result: OutputT | None = None
     error: str = ""
 
 
@@ -47,12 +62,12 @@ class DialogueMessage:
 
 
 @dataclass
-class ConversationState:
+class ConversationState[OutputT: BaseModel]:
     dialogue: tuple[DialogueMessage, ...]
     waiting_for_user: bool
     is_done: bool
     done_note: str
-    final_plan: str
+    result: OutputT | None
     failure: str | None
 
 

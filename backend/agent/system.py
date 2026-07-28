@@ -5,7 +5,7 @@ import json
 import os
 from dataclasses import asdict
 from time import monotonic
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from openinference.semconv.trace import SpanAttributes
@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from pydantic_ai import (
     Agent,
     AgentCapability,
+    AgentRunResult,
     ModelMessage,
     ModelMessagesTypeAdapter,
     RunContext,
@@ -28,11 +29,12 @@ from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_core import to_jsonable_python
 
 from .models import (
+    AuditIssue,
     AuditResult,
+    ContinuePlanning,
     ConversationState,
     DialogueMessage,
     NextMessage,
-    PlanStatus,
     ResearchJob,
     ResearchOutput,
     SystemOutput,
@@ -125,7 +127,15 @@ class AgentSystem[OutputT: BaseModel]:
         self.waiting_for_user: bool = state.get("waiting_for_user", False)
         self.is_done: bool = state.get("is_done", False)
         self.done_note: str = state.get("done_note", "")
+        serialized_result = state.get("result")
+        self.result: OutputT | None = (
+            output_type.model_validate(serialized_result)
+            if serialized_result is not None
+            else None
+        )
         self.failure: str | None = state.get("failure")
+        if self.is_done and self.result is None:
+            raise ValueError("Completed state is missing its structured result")
 
         # Runtime-only state.
         self._state_lock = asyncio.Lock()
@@ -134,7 +144,7 @@ class AgentSystem[OutputT: BaseModel]:
         self._planner_wakeup = asyncio.Event()
         self._speaker_wakeup = asyncio.Event()
         self._done = asyncio.Event()
-        self._outputs: asyncio.Queue[SystemOutput] = asyncio.Queue()
+        self._outputs: asyncio.Queue[SystemOutput[OutputT]] = asyncio.Queue()
         self._tasks: set[asyncio.Task[Any]] = set()
         self._research_tasks: dict[str, asyncio.Task[None]] = {}
         self._planner_active = False
@@ -162,9 +172,24 @@ class AgentSystem[OutputT: BaseModel]:
     ) -> None:
         self._exa_without_citation = ExaWithoutCitation(require_env("EXA_API_KEY"))
 
-        self.planning_agent = Agent(
+        self.planning_agent: Agent[
+            AgentSystem[Any],
+            ContinuePlanning | OutputT,
+        ] = Agent(
             planner_model,
-            output_type=tool_output(PlanStatus),
+            output_type=[
+                ToolOutput(
+                    ContinuePlanning,
+                    name="continue_planning",
+                ),
+                ToolOutput(
+                    self.output_type,
+                    name="submit_result",
+                    description=(
+                        "Submit the complete target object for independent auditing."
+                    ),
+                ),
+            ],
             instructions=self.prompts.render(
                 "planner.md.j2",
                 target=self.target,
@@ -178,9 +203,8 @@ class AgentSystem[OutputT: BaseModel]:
             capabilities=[Instrumentation(InstrumentationSettings(version=2))],
             retries=3,
         )
-        self.planning_agent.tool(
-            self._spawn_research_agent,
-            name="spawn_research_agent",
+        self.planning_agent.tool(name="spawn_research_agent")(
+            self._spawn_research_agent
         )
 
         self.research_agent = Agent(
@@ -254,7 +278,7 @@ class AgentSystem[OutputT: BaseModel]:
     ) -> str:
         return await ctx.deps.run_research(target)
 
-    async def conversation_state(self) -> ConversationState:
+    async def conversation_state(self) -> ConversationState[OutputT]:
         async with self._state_lock:
             return ConversationState(
                 dialogue=tuple(
@@ -264,7 +288,7 @@ class AgentSystem[OutputT: BaseModel]:
                 waiting_for_user=self.waiting_for_user,
                 is_done=self.is_done,
                 done_note=self.done_note,
-                final_plan=self.buffer if self.is_done else "",
+                result=self.result,
                 failure=self.failure,
             )
 
@@ -288,6 +312,11 @@ class AgentSystem[OutputT: BaseModel]:
                 "waiting_for_user": self.waiting_for_user,
                 "is_done": self.is_done,
                 "done_note": self.done_note,
+                "result": (
+                    self.result.model_dump(mode="json")
+                    if self.result is not None
+                    else None
+                ),
                 "failure": self.failure,
             }
         return json.dumps(state)
@@ -306,9 +335,7 @@ class AgentSystem[OutputT: BaseModel]:
         if self.is_done:
             self._done.set()
             await self._outputs.put(
-                SystemOutput(
-                    kind="done", message=self.done_note, final_plan=self.buffer
-                )
+                SystemOutput(kind="done", message=self.done_note, result=self.result)
             )
             return
 
@@ -362,7 +389,7 @@ class AgentSystem[OutputT: BaseModel]:
             self.planner_pending = True
         self._planner_wakeup.set()
 
-    async def receive(self) -> SystemOutput:
+    async def receive(self) -> SystemOutput[OutputT]:
         return await self._outputs.get()
 
     async def wait_done(self) -> None:
@@ -664,7 +691,7 @@ class AgentSystem[OutputT: BaseModel]:
                 findings=[self._render_research(job) for job in findings],
             )
 
-        result = await self._call_planner(
+        planner_run = await self._call_planner(
             prompt,
             history,
             trigger=trigger,
@@ -673,33 +700,41 @@ class AgentSystem[OutputT: BaseModel]:
         )
         finding_ids = {job.id for job in findings}
         async with self._state_lock:
-            self.planner_history = result.all_messages()
+            self.planner_history = planner_run.all_messages()
             self.planner_sent = dialogue_end
             for job in self.research_jobs:
                 if job.id in finding_ids:
                     job.consumed = True
-            self.speaker_pending = True
-        self._speaker_wakeup.set()
 
         audit_retries = 0
-        while result.output.done:
-            audit = await self._run_audit()
-            if audit.output.approved:
-                await self._complete(result.output.note)
+        while not isinstance(planner_run.output, ContinuePlanning):
+            candidate = cast(OutputT, planner_run.output)
+
+            audit = await self._run_audit(candidate)
+            if not audit.output.issues:
+                await self._complete(candidate)
                 return
 
             audit_retries += 1
             if audit_retries > MAX_AUDIT_RETRIES:
-                await self._complete(
-                    "Planner finishing with unresolved audit issues: "
-                    f"{audit.output.issues}"
+                await self._fail(
+                    "audit",
+                    RuntimeError(
+                        "structured completion was rejected after "
+                        f"{audit_retries} attempts: "
+                        f"{self._render_audit_issues(audit.output.issues)}"
+                    ),
                 )
                 return
 
-            result = await self._call_planner(
+            planner_run = await self._call_planner(
                 self.prompts.render(
                     "audit_feedback.md.j2",
-                    issues=audit.output.issues,
+                    candidate=candidate.model_dump(mode="json"),
+                    issues=[
+                        issue.model_dump(mode="json")
+                        for issue in audit.output.issues
+                    ],
                 ),
                 list(self.planner_history),
                 trigger=trigger,
@@ -707,9 +742,11 @@ class AgentSystem[OutputT: BaseModel]:
                 reconciliation_id=reconciliation_id,
             )
             async with self._state_lock:
-                self.planner_history = result.all_messages()
-                self.speaker_pending = True
-            self._speaker_wakeup.set()
+                self.planner_history = planner_run.all_messages()
+
+        async with self._state_lock:
+            self.speaker_pending = True
+        self._speaker_wakeup.set()
 
     async def _call_planner(
         self,
@@ -719,7 +756,7 @@ class AgentSystem[OutputT: BaseModel]:
         trigger: str = "normal",
         reconciliation_link: Any | None = None,
         reconciliation_id: str | None = None,
-    ) -> Any:
+    ) -> AgentRunResult[ContinuePlanning | OutputT]:
         links = (
             [Link(reconciliation_link)]
             if reconciliation_link is not None and reconciliation_link.is_valid
@@ -743,10 +780,18 @@ class AgentSystem[OutputT: BaseModel]:
                 conversation_id=self.session_id,
             )
 
-    async def _run_audit(self) -> Any:
+    async def _run_audit(self, candidate: OutputT) -> Any:
         async with self._state_lock:
             transcript = render_dialogue(self.dialogue)
             plan = self.buffer
+            research_state = [
+                {
+                    "target": job.target,
+                    "status": job.status,
+                    "consumed": job.consumed,
+                }
+                for job in self.research_jobs
+            ]
         with tracer.start_as_current_span(
             "auditor", attributes={SpanAttributes.SESSION_ID: self.session_id}
         ):
@@ -754,11 +799,24 @@ class AgentSystem[OutputT: BaseModel]:
                 self.prompts.render(
                     "audit_request.md.j2",
                     target=self.target,
+                    candidate=candidate.model_dump(mode="json"),
                     conversation=transcript,
                     buffer=plan,
+                    research_state=research_state,
                 ),
                 conversation_id=self.session_id,
             )
+
+    @staticmethod
+    def _render_audit_issues(issues: list[AuditIssue]) -> str:
+        return "; ".join(
+            (
+                f"{issue.field}: {issue.reason}"
+                if issue.field is not None
+                else issue.reason
+            )
+            for issue in issues
+        )
 
     async def _speaker_loop(self) -> None:
         try:
@@ -943,19 +1001,19 @@ class AgentSystem[OutputT: BaseModel]:
     def _stopped(self) -> bool:
         return self._closing or self.is_done or self.failure is not None
 
-    async def _complete(self, note: str) -> None:
+    async def _complete(self, result: OutputT) -> None:
         reconciliation = None
         async with self._state_lock:
+            self.result = result
             self.is_done = True
-            self.done_note = note
-            final_plan = self.buffer
+            self.done_note = self.prompts.render("completion.md.j2")
             reconciliation = self._finish_reconciliation_locked("completed")
         self._record_reconciliation_outcome(reconciliation)
         self._done.set()
         self._planner_wakeup.set()
         self._speaker_wakeup.set()
         await self._outputs.put(
-            SystemOutput(kind="done", message=note, final_plan=final_plan)
+            SystemOutput(kind="done", message=self.done_note, result=result)
         )
 
     async def _fail(self, source: str, exc: BaseException) -> None:

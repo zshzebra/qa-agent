@@ -20,12 +20,12 @@ class SessionMessage(BaseModel):
     content: str
 
 
-class SessionSnapshot(BaseModel):
+class SessionSnapshot[OutputT: BaseModel](BaseModel):
     revision: int
     status: Literal["working", "waiting_for_user", "completed", "failed"]
     messages: list[SessionMessage]
     completion_message: str | None = None
-    final_plan: str | None = None
+    result: OutputT | None = None
     error: str | None = None
 
 
@@ -33,13 +33,16 @@ class SendMessageRequest(BaseModel):
     content: str
 
 
-class SessionSupervisor:
-    def __init__(self, system: AgentSystem) -> None:
+class SessionSupervisor[OutputT: BaseModel]:
+    def __init__(
+        self,
+        system: AgentSystem[OutputT],
+    ) -> None:
         self.system = system
         self._start_lock = asyncio.Lock()
         self._publish_lock = asyncio.Lock()
         self._output_task: asyncio.Task[None] | None = None
-        self._subscribers: set[asyncio.Queue[SessionSnapshot]] = set()
+        self._subscribers: set[asyncio.Queue[SessionSnapshot[OutputT]]] = set()
         self._revision = 0
 
     async def start(self) -> None:
@@ -49,22 +52,27 @@ class SessionSupervisor:
             await self.system.run()
             self._output_task = asyncio.create_task(self._pump_outputs())
 
-    async def snapshot(self) -> SessionSnapshot:
+    async def snapshot(self) -> SessionSnapshot[OutputT]:
         async with self._publish_lock:
             return await self._snapshot()
 
-    async def send(self, content: str) -> SessionSnapshot:
+    async def send(self, content: str) -> SessionSnapshot[OutputT]:
         await self.system.send(content)
         return await self._publish()
 
-    async def subscribe(self) -> asyncio.Queue[SessionSnapshot]:
-        subscriber: asyncio.Queue[SessionSnapshot] = asyncio.Queue(maxsize=1)
+    async def subscribe(self) -> asyncio.Queue[SessionSnapshot[OutputT]]:
+        subscriber: asyncio.Queue[SessionSnapshot[OutputT]] = asyncio.Queue(
+            maxsize=1
+        )
         async with self._publish_lock:
             self._subscribers.add(subscriber)
             subscriber.put_nowait(await self._snapshot())
         return subscriber
 
-    async def unsubscribe(self, subscriber: asyncio.Queue[SessionSnapshot]) -> None:
+    async def unsubscribe(
+        self,
+        subscriber: asyncio.Queue[SessionSnapshot[OutputT]],
+    ) -> None:
         async with self._publish_lock:
             self._subscribers.discard(subscriber)
 
@@ -81,7 +89,7 @@ class SessionSupervisor:
             await self.system.receive()
             await self._publish()
 
-    async def _publish(self) -> SessionSnapshot:
+    async def _publish(self) -> SessionSnapshot[OutputT]:
         async with self._publish_lock:
             self._revision += 1
             snapshot = await self._snapshot()
@@ -91,7 +99,7 @@ class SessionSupervisor:
                 subscriber.put_nowait(snapshot)
             return snapshot
 
-    async def _snapshot(self) -> SessionSnapshot:
+    async def _snapshot(self) -> SessionSnapshot[OutputT]:
         state = await self.system.conversation_state()
         if state.failure is not None:
             session_status = "failed"
@@ -110,18 +118,25 @@ class SessionSupervisor:
                 for message in state.dialogue
             ],
             completion_message=state.done_note or None,
-            final_plan=state.final_plan or None,
+            result=state.result,
             error=state.failure,
         )
 
 
+AppSupervisor = SessionSupervisor[ExampleCompanyOnboarding]
+AppSnapshot = SessionSnapshot[ExampleCompanyOnboarding]
+
+
 class SessionRegistry:
     def __init__(self) -> None:
-        self._supervisors: dict[str, SessionSupervisor] = {}
+        self._supervisors: dict[str, AppSupervisor] = {}
         self._lock = asyncio.Lock()
         self._model = GoogleModel("gemini-3.1-flash-lite-preview")
 
-    async def get(self, key: str) -> SessionSupervisor:
+    async def get(
+        self,
+        key: str,
+    ) -> AppSupervisor:
         async with self._lock:
             supervisor = self._supervisors.get(key)
             if supervisor is None:
@@ -170,26 +185,35 @@ async def session_key(
 
 async def current_supervisor(
     key: Annotated[str, Depends(session_key)],
-) -> SessionSupervisor:
+) -> AppSupervisor:
     return await session_registry.get(key)
 
 
-@router.get("/session", response_model=SessionSnapshot)
+@router.get(
+    "/session",
+    response_model=AppSnapshot,
+)
 async def get_session(
-    supervisor: Annotated[SessionSupervisor, Depends(current_supervisor)],
-) -> SessionSnapshot:
+    supervisor: Annotated[
+        AppSupervisor,
+        Depends(current_supervisor),
+    ],
+) -> AppSnapshot:
     return await supervisor.snapshot()
 
 
 @router.post(
     "/session/messages",
-    response_model=SessionSnapshot,
+    response_model=AppSnapshot,
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def send_message(
     request: SendMessageRequest,
-    supervisor: Annotated[SessionSupervisor, Depends(current_supervisor)],
-) -> SessionSnapshot:
+    supervisor: Annotated[
+        AppSupervisor,
+        Depends(current_supervisor),
+    ],
+) -> AppSnapshot:
     content = request.content.strip()
     if not content:
         raise HTTPException(
@@ -207,7 +231,10 @@ async def send_message(
 
 @router.get("/session/events")
 async def session_events(
-    supervisor: Annotated[SessionSupervisor, Depends(current_supervisor)],
+    supervisor: Annotated[
+        AppSupervisor,
+        Depends(current_supervisor),
+    ],
 ) -> StreamingResponse:
     subscriber = await supervisor.subscribe()
 

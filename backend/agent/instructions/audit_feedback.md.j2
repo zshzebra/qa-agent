@@ -1,7 +1,12 @@
-The auditor rejected completion with these issues:
+The auditor rejected this submitted candidate:
 
-{{ issues }}
+{{ candidate | tojson(indent=2) }}
 
-Do not finish. Correct the working buffer so unsupported confirmations become
-unconfirmed findings, incorporate any other audit issues, and update the `Next
-message to user` note with the exact confirmation or information needed.
+Audit issues:
+{{ issues | tojson(indent=2) }}
+
+Correct the candidate if the conversation already supports the correction.
+Otherwise update the working buffer so unsupported confirmations become
+unconfirmed findings and set the `Next message to user` note to the exact
+confirmation or information needed. Call `continue_planning` when user input or
+research is required. Submit a revised result only when every issue is resolved.
