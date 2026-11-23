@@ -1,6 +1,6 @@
 from datetime import date
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, EmailStr
 
 
 class ExampleCompanyOnboarding(BaseModel):
@@ -12,8 +12,9 @@ class ExampleCompanyOnboarding(BaseModel):
     abn: str = Field(description="The company's Australian Business Number.")
     address: str = Field(description="The company's primary business address.")
     phone: str = Field(description="The company's primary contact phone number.")
-    email: str = Field(description="The company's primary contact email address.")
+    email: EmailStr = Field(description="The company's primary contact email address.")
     date_first_active: date = Field(
         description="The date the company first became active."
     )
-    founder: str = Field(description="The name of the company's founder.")
+    founders: list[str] = Field(min_length=1, description="The name of the company's founder, as full names.")
+    customer_samples: list[str] = Field(description="A few named examples of the business's customers, with their description.")
