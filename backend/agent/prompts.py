@@ -1,3 +1,5 @@
+import json
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +15,11 @@ class PromptRenderer:
             autoescape=False,
             trim_blocks=True,
             lstrip_blocks=True,
+            extensions=["jinja2.ext.do"],
         )
+        # Jinja `tojson` escapes some characters we want to include
+        self.environment.filters["tojson"] = partial(json.dumps, ensure_ascii=False)
 
     def render(self, template: str, **context: Any) -> str:
         return self.environment.get_template(template).render(**context).strip()
+

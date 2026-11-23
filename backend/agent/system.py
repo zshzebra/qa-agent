@@ -41,7 +41,7 @@ from .models import (
     render_dialogue,
 )
 from .prompts import PromptRenderer
-from .target import TargetContext
+from .target import describe_target
 from .tools.buffer import BufferToolset
 from .tools.exa import ExaWithoutCitation
 
@@ -92,7 +92,7 @@ class AgentSystem[OutputT: BaseModel]:
         state: dict[str, Any] | None = None,
     ) -> None:
         self.output_type = output_type
-        self.target = TargetContext.from_model(output_type)
+        self.target = describe_target(output_type)
         self.prompts = PromptRenderer()
         state = state or {}
 

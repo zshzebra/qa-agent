@@ -1,0 +1,166 @@
+{%- set FORMATS = {
+  "email": "email address",
+  "name-email": "name and email address, like `Jane Doe <jane@example.com>`",
+  "uri": "URL",
+  "date": "date, YYYY-MM-DD",
+  "date-time": "date and time, ISO 8601, like 2024-01-31T09:30:00+11:00",
+  "time": "time of day, HH:MM[:SS]",
+  "duration": "duration, ISO 8601, like P3DT4H",
+  "uuid": "UUID",
+  "uuid1": "UUID version 1",
+  "uuid3": "UUID version 3",
+  "uuid4": "UUID version 4",
+  "uuid5": "UUID version 5",
+  "ipv4": "IPv4 address",
+  "ipv6": "IPv6 address",
+  "ipvanyaddress": "IPv4 or IPv6 address",
+  "ipvanyinterface": "IP interface, like 192.168.0.1/24",
+  "ipvanynetwork": "IP network, like 192.168.0.0/24",
+  "binary": "text, raw bytes",
+  "base64": "base64-encoded text",
+  "base64url": "URL-safe base64-encoded text",
+  "password": "secret text",
+  "path": "file path",
+  "file-path": "path to an existing file",
+  "directory-path": "path to an existing directory",
+  "color": "colour, as a name, hex or rgb()",
+  "payment-card-number": "payment card number",
+} -%}
+
+{%- set KINDS = {
+  "integer": "whole number",
+  "number": "number",
+  "boolean": "true or false",
+  "null": "null",
+  "any": "any value",
+} -%}
+
+{%- macro range(lo, hi, unit) -%}
+  {%- set plural = unit ~ ("" if (hi if hi is not none else lo) == 1 else "s") -%}
+  {%- if lo is not none and hi is not none and lo == hi -%}
+    exactly {{ lo }} {{ plural }}
+  {%- elif lo is not none and hi is not none -%}
+    {{ lo }}–{{ hi }} {{ plural }}
+  {%- elif lo is not none -%}
+    at least {{ lo }} {{ plural }}
+  {%- else -%}
+    at most {{ hi }} {{ plural }}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro constraint_list(t) -%}
+  {%- set c = t.constraints -%}
+  {%- set out = [] -%}
+  {%- if "min_length" in c or "max_length" in c -%}
+    {%- do out.append(range(c.get("min_length"), c.get("max_length"), "character")) -%}
+  {%- endif -%}
+  {%- if "min_items" in c or "max_items" in c -%}
+    {%- do out.append(range(c.get("min_items"), c.get("max_items"), "item")) -%}
+  {%- endif -%}
+  {%- if "min_properties" in c or "max_properties" in c -%}
+    {%- do out.append(range(c.get("min_properties"), c.get("max_properties"), "entry")) -%}
+  {%- endif -%}
+  {%- if c.get("unique_items") -%}{%- do out.append("no duplicates") -%}{%- endif -%}
+  {%- if "minimum" in c -%}{%- do out.append("≥ " ~ c.minimum) -%}{%- endif -%}
+  {%- if "exclusive_minimum" in c -%}{%- do out.append("> " ~ c.exclusive_minimum) -%}{%- endif -%}
+  {%- if "maximum" in c -%}{%- do out.append("≤ " ~ c.maximum) -%}{%- endif -%}
+  {%- if "exclusive_maximum" in c -%}{%- do out.append("< " ~ c.exclusive_maximum) -%}{%- endif -%}
+  {%- if "multiple_of" in c -%}{%- do out.append("a multiple of " ~ c.multiple_of) -%}{%- endif -%}
+  {%- if "pattern" in c -%}{%- do out.append("must match the regular expression `" ~ c.pattern ~ "`") -%}{%- endif -%}
+  {%- if t.nullable -%}{%- do out.append("may be null") -%}{%- endif -%}
+  {%- if t.deprecated -%}{%- do out.append("deprecated") -%}{%- endif -%}
+  {%- if t.extra -%}{%- do out.append("additional schema rules: " ~ (t.extra | tojson)) -%}{%- endif -%}
+  {{- out | join("; ") -}}
+{%- endmacro -%}
+
+{%- macro values(vs) -%}
+  {%- for v in vs -%}`{{ v | tojson }}`{{ ", " if not loop.last }}{%- endfor -%}
+{%- endmacro -%}
+
+{%- macro inner(t) -%}
+  {%- set details = constraint_list(t) -%}
+  {%- set note = [] -%}
+  {%- if details %}{% do note.append(details) %}{% endif -%}
+  {%- if t.description %}{% do note.append(t.description) %}{% endif -%}
+  {%- if t.examples %}{% do note.append("e.g. " ~ values(t.examples)) %}{% endif -%}
+  {{- label(t) }}{% if note %} ({{ note | join("; ") }}){% endif -%}
+{%- endmacro -%}
+
+{%- macro label(t) -%}
+  {%- if t.kind == "text" -%}
+    {%- if t.content is not none -%}
+      text containing {{ t.content_media_type or "encoded data" }} for {{ inner(t.content) }}
+    {%- elif t.format -%}
+      {{- FORMATS.get(t.format, "text in `" ~ t.format ~ "` format") -}}
+    {%- else -%}
+      text
+    {%- endif -%}
+  {%- elif t.kind == "number" and t.format == "decimal" -%}
+    decimal number, as a number or as text
+  {%- elif t.kind in KINDS -%}
+    {{- KINDS[t.kind] -}}
+  {%- elif t.kind == "enum" -%}
+    {%- if t.values | length == 1 -%}exactly {{ values(t.values) }}{%- else -%}one of {{ values(t.values) }}{%- endif -%}
+  {%- elif t.kind == "const" -%}
+    exactly {{ values(t.values) }}
+  {%- elif t.kind == "list" -%}
+    list of {{ inner(t.items) }}
+  {%- elif t.kind == "tuple" -%}
+    {%- if not t.prefix -%}
+      empty list
+    {%- else -%}
+      list of exactly: {% for p in t.prefix %}{{ inner(p) }}{{ ", " if not loop.last }}{% endfor %}
+    {%- endif -%}
+    {%- if t.items is not none %}, then any number of {{ inner(t.items) }}{% endif -%}
+  {%- elif t.kind == "map" -%}
+    map from {{ inner(t.keys) }} to {{ inner(t.items) }}
+  {%- elif t.kind == "object" -%}
+    `{{ t.name }}`, fields below
+  {%- elif t.kind == "seen" -%}
+    `{{ t.name }}`, fields described above
+  {%- elif t.kind == "recursive" -%}
+    `{{ t.name }}`, the same structure as the enclosing `{{ t.name }}`
+  {%- elif t.kind == "union" -%}
+    {%- if t.discriminator -%}one of the following, chosen by `{{ t.discriminator }}`: {% endif -%}
+    {%- for o in t.options %}{{ inner(o) }}{{ " or " if not loop.last }}{% endfor -%}
+  {%- elif t.kind == "all_of" -%}
+    a value satisfying all of: {% for o in t.options %}{{ inner(o) }}{{ "; " if not loop.last }}{% endfor -%}
+  {%- else -%}
+    {{ t.kind }}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro field(f, depth=0) -%}
+  {%- set t = f.type -%}
+  {%- set meta = [label(t)] -%}
+  {%- if not f.required %}{% do meta.append("optional") %}{% endif -%}
+  {%- if t.has_default %}{% do meta.append("default " ~ values([t.default])) %}{% endif -%}
+  {%- set details = constraint_list(t) -%}
+  {%- if details %}{% do meta.append(details) %}{% endif -%}
+  {{ "  " * depth }}- `{{ f.name }}` ({{ meta | join("; ") }})
+  {%- if t.description %} — {{ t.description }}{% endif -%}
+  {%- if t.summary and t.kind == "enum" %} ({{ t.name }}: {{ t.summary }}){% endif -%}
+  {%- if t.examples %} Examples: {{ values(t.examples) }}.{% endif -%}
+  {%- for m in t.models -%}
+    {{ "\n" ~ model(m, depth + 1) }}
+  {%- endfor -%}
+{%- endmacro -%}
+
+{%- macro model(m, depth) -%}
+  {{ "  " * depth }}`{{ m.name }}`{% if m.description %} — {{ m.description }}{% endif %}:
+  {%- for f in m.fields %}{{ "\n" ~ field(f, depth) }}{% endfor -%}
+  {{- "\n" ~ extra_fields(m, depth) if extra_fields(m, depth) -}}
+{%- endmacro -%}
+
+{%- macro extra_fields(m, depth) -%}
+  {%- if m.extra_fields is false -%}
+    {{ "  " * depth }}- No other fields are allowed.
+  {%- elif m.extra_fields is not none -%}
+    {{ "  " * depth }}- Other fields may be added; each value: {{ inner(m.extra_fields) }}.
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro fields(m) -%}
+  {%- for f in m.fields %}{{ field(f) }}{{ "\n" if not loop.last }}{% endfor -%}
+  {{- "\n" ~ extra_fields(m, 0) if extra_fields(m, 0) -}}
+{%- endmacro -%}
