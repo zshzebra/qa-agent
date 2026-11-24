@@ -20,6 +20,11 @@ class SessionMessage(BaseModel):
     content: str
 
 
+class ActiveResearcher(BaseModel):
+    id: str
+    domains: list[str]
+
+
 class SessionSnapshot[OutputT: BaseModel](BaseModel):
     revision: int
     status: Literal["working", "waiting_for_user", "completed", "failed"]
@@ -27,6 +32,7 @@ class SessionSnapshot[OutputT: BaseModel](BaseModel):
     completion_message: str | None = None
     result: OutputT | None = None
     error: str | None = None
+    researchers: list[ActiveResearcher] = []
 
 
 class SendMessageRequest(BaseModel):
@@ -120,6 +126,10 @@ class SessionSupervisor[OutputT: BaseModel]:
             completion_message=state.done_note or None,
             result=state.result,
             error=state.failure,
+            researchers=[
+                ActiveResearcher(id=r.id, domains=list(r.domains))
+                for r in state.researchers
+            ],
         )
 
 

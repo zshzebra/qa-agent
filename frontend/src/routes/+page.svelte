@@ -1,5 +1,7 @@
 <script lang="ts">
+	import { page } from '$app/state';
 	import { createSessionClient } from '$lib';
+	import ResearcherPills from '$lib/components/researcher-pills.svelte';
 	import Button from '$lib/components/ui/button/button.svelte';
 	import Input from '$lib/components/ui/input/input.svelte';
 	import Skeleton from '$lib/components/ui/skeleton/skeleton.svelte';
@@ -11,6 +13,9 @@
 	});
 
 	let message = $state('');
+
+	const verbose = $derived(page.url.searchParams.has('verbose'));
+	const researchers = $derived($agent.session?.researchers ?? []);
 
 	$effect(() => {
 		void agent.start();
@@ -50,6 +55,9 @@
 	</div>
 
 	{#if $agent.session?.status != 'completed'}
+		{#if verbose}
+			<ResearcherPills {researchers} />
+		{/if}
 		<form onsubmit={handleSubmit} class="flex flex-row">
 			<Input bind:value={message} placeholder="Amazo..." />
 			<Button disabled={$agent.sending}>Send</Button>

@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -44,7 +44,7 @@ class AuditResult(BaseModel):
 
 @dataclass
 class SystemOutput[OutputT: BaseModel]:
-    kind: Literal["message", "state", "done", "error"]
+    kind: Literal["message", "state", "progress", "done", "error"]
     message: str = ""
     expects_reply: bool = False
     result: OutputT | None = None
@@ -61,6 +61,12 @@ class DialogueMessage:
         return f"{label}: {self.content}"
 
 
+@dataclass(frozen=True)
+class ActiveResearcher:
+    id: str
+    domains: tuple[str, ...]
+
+
 @dataclass
 class ConversationState[OutputT: BaseModel]:
     dialogue: tuple[DialogueMessage, ...]
@@ -69,6 +75,7 @@ class ConversationState[OutputT: BaseModel]:
     done_note: str
     result: OutputT | None
     failure: str | None
+    researchers: tuple[ActiveResearcher, ...] = ()
 
 
 def render_dialogue(messages: list[DialogueMessage]) -> str:
@@ -84,3 +91,5 @@ class ResearchJob:
     error: str | None = None
     completion_order: int | None = None
     consumed: bool = False
+    started_at: float | None = None
+    domains: list[str] = field(default_factory=list)

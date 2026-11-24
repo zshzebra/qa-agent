@@ -34,7 +34,8 @@ function isSessionSnapshot(value: unknown): value is SessionSnapshot {
 		typeof candidate.revision === 'number' &&
 		typeof candidate.status === 'string' &&
 		SESSION_STATUSES.includes(candidate.status as SessionStatus) &&
-		Array.isArray(candidate.messages)
+		Array.isArray(candidate.messages) &&
+		Array.isArray(candidate.researchers)
 	);
 }
 

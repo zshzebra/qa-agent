@@ -7,6 +7,13 @@ export interface SessionMessage {
 	content: string;
 }
 
+/** A researcher that is running now. */
+export interface ActiveResearcher {
+	id: string;
+	/** The domains of every source used by a researcher */
+	domains: string[];
+}
+
 export interface SessionSnapshot {
 	revision: number;
 	status: SessionStatus;
@@ -14,6 +21,8 @@ export interface SessionSnapshot {
 	completion_message: string | null;
 	result: Record<string, unknown> | null;
 	error: string | null;
+	/** The active researchers in launch order */
+	researchers: ActiveResearcher[];
 }
 
 export interface SessionStoreState {

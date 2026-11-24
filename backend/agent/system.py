@@ -29,6 +29,7 @@ from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_core import to_jsonable_python
 
 from .models import (
+    ActiveResearcher,
     AuditIssue,
     AuditResult,
     ContinuePlanning,
@@ -170,7 +171,9 @@ class AgentSystem[OutputT: BaseModel]:
         researcher_model: Model,
         auditor_model: Model,
     ) -> None:
-        self._exa_without_citation = ExaWithoutCitation(require_env("EXA_API_KEY"))
+        self._exa_without_citation = ExaWithoutCitation(
+            require_env("EXA_API_KEY"), self._record_sources
+        )
 
         self.planning_agent: Agent[
             AgentSystem[Any],
@@ -213,6 +216,7 @@ class AgentSystem[OutputT: BaseModel]:
                 "researcher.md.j2",
                 target=self.target,
             ),
+            deps_type=str,
             output_type=tool_output(ResearchOutput),
             toolsets=[self._exa_without_citation.exa_toolset],
             capabilities=instrumented_capabilities(
@@ -290,6 +294,13 @@ class AgentSystem[OutputT: BaseModel]:
                 done_note=self.done_note,
                 result=self.result,
                 failure=self.failure,
+                researchers=tuple(
+                    ActiveResearcher(id=job.id, domains=tuple(job.domains))
+                    for job in sorted(
+                        (j for j in self.research_jobs if j.status == "running"),
+                        key=lambda j: j.started_at or 0.0,
+                    )
+                ),
             )
 
     async def serialize(self) -> str:
@@ -932,7 +943,9 @@ class AgentSystem[OutputT: BaseModel]:
             async with self._state_lock:
                 job = self._job(job_id)
                 job.status = "running"
+                job.started_at = monotonic()
                 target = job.target
+            await self._progress()
 
             links = [Link(dispatch_ctx)] if dispatch_ctx is not None else []
             with tracer.start_as_current_span(
@@ -950,6 +963,7 @@ class AgentSystem[OutputT: BaseModel]:
                         research_target=target,
                     ),
                     conversation_id=self.session_id,
+                    deps=job_id,
                 )
 
             out = run.output
@@ -966,12 +980,15 @@ class AgentSystem[OutputT: BaseModel]:
                 job.completion_order = self.research_completion_order
                 self.research_completion_order += 1
                 self.planner_pending = True
+            await self._progress()
 
         except asyncio.CancelledError:
             async with self._state_lock:
                 job = self._job(job_id)
                 if job.status == "running":
                     job.status = "queued"
+            if not self._closing:
+                await self._progress()
             raise
         except Exception as exc:
             async with self._state_lock:
@@ -981,9 +998,22 @@ class AgentSystem[OutputT: BaseModel]:
                 job.completion_order = self.research_completion_order
                 self.research_completion_order += 1
                 self.planner_pending = True
+            await self._progress()
         finally:
             if not self._closing:
                 self._planner_wakeup.set()
+
+    async def _record_sources(self, job_id: str, domains: list[str]) -> None:
+        async with self._state_lock:
+            job = self._job(job_id)
+            if job.status != "running":
+                return
+            job.domains.extend(domains)
+        await self._progress()
+
+    async def _progress(self) -> None:
+        """Tell observers that the set of active researchers changed."""
+        await self._outputs.put(SystemOutput(kind="progress"))
 
     def _job(self, job_id: str) -> ResearchJob:
         return next(job for job in self.research_jobs if job.id == job_id)
